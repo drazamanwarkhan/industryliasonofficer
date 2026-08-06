@@ -205,6 +205,11 @@
   .sidebar-user{padding:2px 0 4px;}
   .sidebar-user .uname{font-size:13.5px; font-weight:600; color:#fff;}
   .sidebar-user .urole{font-size:11px; color:var(--brand-300); margin-top:2px; margin-bottom:10px;}
+  .sync-badge{font-size:10.5px; padding:7px 10px; border-radius:8px; margin:2px 0 10px; line-height:1.4;}
+  .sync-badge.off{background:rgba(255,255,255,.06); color:var(--brand-300);}
+  .sync-badge.syncing{background:rgba(255,200,80,.15); color:#ffcf6b;}
+  .sync-badge.ok{background:rgba(80,200,140,.15); color:#7fe3ac;}
+  .sync-badge.error{background:rgba(230,90,90,.18); color:#ff9b9b;}
 
 </style>
 </head>
@@ -251,6 +256,13 @@
    ========================================================================= */
 
 const STORAGE_KEY = "internship-bridge-db-v5";
+// Google Apps Script Web App that backs this instance's Google Drive folder
+// (https://drive.google.com/drive/folders/1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY).
+// Wired in directly so syncing runs automatically with no visible settings UI.
+const DEFAULT_CLOUD_SYNC_URL = "https://script.google.com/a/macros/dsu.edu.pk/s/AKfycbxXfmBqS9O7_CWGVkPiMV5F08ghpSnqHp71B7LUKbCQPFbUzNSpAQLH1Bp54rQV9p3NZQ/exec";
+// Pre-built ATS-friendly sample CV (Word .docx), embedded as base64 so it can
+// be downloaded from the Student Profile tab with no server/backend needed.
+const ATS_CV_TEMPLATE_B64 = "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";
 let DB = null;
 let VIEWER_ID = null;
 let VIEW = { name: null, params: {} };
@@ -338,6 +350,7 @@ function seedDB(){
     users: [], students: [], companies: [], postings: [], applications: [],
     internships: [], weeklyLogs: [], attendance: [], criteria: [], evaluations: [],
     siteVisits: [], notifications: [], jobApplications: [], universityJobs: [], universityJobApps: [],
+    settings: { cloudSyncUrl: DEFAULT_CLOUD_SYNC_URL, lastSyncedAt: null, lastSyncStatus: "" },
   };
 
   db.criteria = CRITERIA_SEED.map((c,i)=>({ id: uid("crit"), ...c, maxScore:10, sortOrder:i+1, active:true }));
@@ -421,11 +434,129 @@ async function loadDB(){
     DB = seedDB();
     await saveDB();
   }
+  ensureSettings(DB);
 }
 async function saveDB(){
   try{
     await window.storage.set(STORAGE_KEY, JSON.stringify(DB), true);
   }catch(e){ console.error("Storage error", e); }
+}
+
+/* ---------------------------- Google Drive Cloud Sync ----------------------------
+   Data is saved to the Industry Liaison Office's Google Drive folder
+   (https://drive.google.com/drive/folders/1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY)
+   through a Google Apps Script Web App that the Liaison Officer / HOD deploys
+   once (see the "Cloud Sync" tab for the script and setup steps). Every
+   mutate() pushes the latest data to that script; on boot, if a Web App URL
+   is configured, the app pulls the Drive copy so the same data follows you
+   across browsers/devices. Local storage always keeps a fast, offline-safe
+   copy regardless of whether cloud sync is configured. */
+let SYNC_TIMER = null;
+let SYNC_STATE = "idle"; // idle | syncing | error
+function scheduleCloudPush(){
+  if(!DB || !DB.settings || !DB.settings.cloudSyncUrl) return;
+  clearTimeout(SYNC_TIMER);
+  SYNC_TIMER = setTimeout(()=>{ pushToDrive().catch(()=>{}); }, 600);
+}
+async function pushToDrive(silent){
+  const url = DB?.settings?.cloudSyncUrl;
+  if(!url) return false;
+  SYNC_STATE = "syncing";
+  updateSyncBadge();
+  try{
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids a CORS preflight against Apps Script
+      body: JSON.stringify(DB),
+    });
+    const raw = await res.text();
+    let json;
+    try{ json = JSON.parse(raw); }
+    catch(parseErr){
+      throw new Error(`Apps Script did not return JSON (HTTP ${res.status}). First 200 chars: ${raw.slice(0,200)}`);
+    }
+    if(json && json.status === "error") throw new Error(json.message || "Apps Script returned an error");
+    DB.settings.lastSyncedAt = nowISO();
+    DB.settings.lastSyncStatus = "ok";
+    await saveDB();
+    SYNC_STATE = "idle";
+    updateSyncBadge();
+    if(!silent) toast("Saved to Google Drive.");
+    return true;
+  }catch(e){
+    console.error("Cloud push failed:", e.message || e);
+    DB.settings.lastSyncStatus = "error";
+    await saveDB();
+    SYNC_STATE = "error";
+    updateSyncBadge();
+    if(!silent) toast("Couldn't reach Google Drive — check the Cloud Sync setup.");
+    return false;
+  }
+}
+async function pullFromDrive(silent){
+  const url = DB?.settings?.cloudSyncUrl;
+  if(!url) return false;
+  SYNC_STATE = "syncing";
+  updateSyncBadge();
+  try{
+    const res = await fetch(url, { method:"GET" });
+    const raw = await res.text();
+    let cloud;
+    try{ cloud = JSON.parse(raw); }
+    catch(parseErr){
+      throw new Error(`Apps Script did not return JSON (HTTP ${res.status}). First 200 chars: ${raw.slice(0,200)}`);
+    }
+    if(!cloud || !Array.isArray(cloud.users)) throw new Error("Drive file is empty or not yet initialized");
+    cloud.settings = cloud.settings || {};
+    cloud.settings.cloudSyncUrl = url; // keep using this device's configured endpoint
+    cloud.settings.lastSyncedAt = nowISO();
+    cloud.settings.lastSyncStatus = "ok";
+    DB = cloud;
+    ensureSettings(DB);
+    await saveDB();
+    SYNC_STATE = "idle";
+    updateSyncBadge();
+    if(!silent) toast("Pulled the latest data from Google Drive.");
+    return true;
+  }catch(e){
+    console.error("Cloud pull failed:", e.message || e);
+    SYNC_STATE = "error";
+    updateSyncBadge();
+    if(!silent) toast("Couldn't pull from Google Drive — check the Cloud Sync setup.");
+    return false;
+  }
+}
+// Diagnostic helper — run testCloudSync() in the browser DevTools console
+// (F12 -> Console) to see exactly why Drive sync is or isn't working.
+window.testCloudSync = async function(){
+  const url = DB?.settings?.cloudSyncUrl;
+  console.log("Configured Apps Script URL:", url);
+  if(!url){ console.log("No URL configured."); return; }
+  try{
+    const res = await fetch(url, { method:"GET" });
+    const raw = await res.text();
+    console.log("HTTP status:", res.status, res.statusText);
+    console.log("Raw response (first 500 chars):", raw.slice(0,500));
+    try{
+      const json = JSON.parse(raw);
+      console.log("✅ Parsed as JSON successfully:", json);
+    }catch(e){
+      console.log("❌ Response is NOT valid JSON — this usually means Google returned a login/permission page instead of your script's output. Check the deployment's 'Who has access' setting is exactly 'Anyone' (not 'Anyone within [your domain]').");
+    }
+  }catch(e){
+    console.log("❌ Network/fetch error (often CORS or the URL being unreachable):", e.message || e);
+  }
+};
+function updateSyncBadge(){
+  const el = document.getElementById("syncBadge");
+  if(!el) return;
+  const url = DB?.settings?.cloudSyncUrl;
+  if(!url){ el.textContent = "☁ Drive sync not connected"; el.className = "sync-badge off"; return; }
+  if(SYNC_STATE==="syncing"){ el.textContent = "☁ Syncing to Drive…"; el.className = "sync-badge syncing"; return; }
+  if(SYNC_STATE==="error" || DB.settings.lastSyncStatus==="error"){ el.textContent = "☁ Drive sync failed"; el.className = "sync-badge error"; return; }
+  const t = DB.settings.lastSyncedAt ? new Date(DB.settings.lastSyncedAt).toLocaleTimeString() : "never";
+  el.textContent = `☁ Synced to Drive · ${t}`;
+  el.className = "sync-badge ok";
 }
 /* Every STUDENT login always owns a student profile record, so the
    "My Profile" tab exists the moment the account is created — whatever
@@ -443,11 +574,17 @@ function ensureStudentProfiles(db){
   // A student record whose account changed role should not linger as a profile.
   db.students.forEach(s=>{ const u = db.users.find(x=>x.id===s.userId); if(u && u.role!=="STUDENT") u.role = u.role; });
 }
+function ensureSettings(db){
+  if(!db.settings) db.settings = { cloudSyncUrl:"", lastSyncedAt:null, lastSyncStatus:"" };
+  if(!db.settings.cloudSyncUrl) db.settings.cloudSyncUrl = DEFAULT_CLOUD_SYNC_URL;
+}
 async function mutate(fn){
   fn(DB);
   ensureStudentProfiles(DB);
+  ensureSettings(DB);
   await saveDB();
   render();
+  scheduleCloudPush();
 }
 function toast(msg){
   const t = document.createElement("div");
@@ -528,6 +665,14 @@ const ROLE_LABEL = {
 /* ---------------------------- Boot ---------------------------- */
 async function boot(){
   await loadDB();
+  // If Drive sync is configured, pull the latest saved copy first so the
+  // same data follows the Liaison Office across browsers/devices. If Drive
+  // has nothing yet (first-ever run), push this browser's copy up so the
+  // Drive file gets initialized.
+  if(DB?.settings?.cloudSyncUrl){
+    const pulled = await pullFromDrive(true);
+    if(!pulled) pushToDrive(true).catch(()=>{});
+  }
   // Keep existing records in sync: every internship with a supervisor gets its
   // survey records so HOD / Liaison Survey Feedback is always complete.
   ensureStudentProfiles(DB);
@@ -598,6 +743,7 @@ function renderSidebar(user){
 
   document.getElementById("viewerName").textContent = user.name;
   document.getElementById("viewerRole").textContent = ROLE_LABEL[user.role] || user.role;
+  updateSyncBadge();
 }
 
 function renderContent(user){
@@ -627,6 +773,7 @@ function renderContent(user){
     case "matching": html = renderMatching(user); break;
     case "criteria": html = renderCriteria(user); break;
     case "reports": html = renderReports(user); break;
+    case "sync": html = renderCloudSync(user); break;
 
     case "facultyInterns": html = renderFacultyInterns(user); break;
     case "feedback": html = renderFeedbackSurveys(user); break;
@@ -784,7 +931,7 @@ function ownerOnlyNotice(pageEyebrow, pageTitle, hint, redirectKey, redirectLabe
 /* ---------------------------- Notifications ---------------------------- */
 function renderNotifications(user){
   const items = notifsFor(user.id);
-  let out = pageHeader("Module 9","Notifications", `<button class="btn btn-secondary" onclick="markAllRead('${user.id}')">Mark all as read</button>`);
+  let out = pageHeader("Alerts","Notifications", `<button class="btn btn-secondary" onclick="markAllRead('${user.id}')">Mark all as read</button>`);
   if(items.length===0){ out += `<div class="card">${emptyState("You're all caught up","Reminders about reports, evaluations, and visits will appear here.")}</div>`; return out; }
   out += items.map(n=>`
     <div class="card pad" style="margin-bottom:8px; cursor:pointer; ${n.isRead?'opacity:.6;':''}" onclick="markRead('${n.id}')">
@@ -818,6 +965,16 @@ function renderStudentProfile(user){
     <span class="muted" style="margin-left:14px;">Program:</span><span class="mono">${s.program}</span>
   </div>`;
 
+  out += `<div class="card pad" style="margin-bottom:14px; border-color:var(--brand-200); background:var(--brand-50);">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:14px; flex-wrap:wrap;">
+      <div>
+        <div class="name">ATS-Friendly CV Template (Word)</div>
+        <div class="muted" style="margin-top:2px; max-width:56ch;">A single-column, no-table sample CV formatted to parse cleanly in applicant tracking systems, with dummy example content. Download it and replace the placeholder details with your own.</div>
+      </div>
+      <button class="btn btn-primary" onclick="downloadATSTemplate()">⬇ Download template (.docx)</button>
+    </div>
+  </div>`;
+
   out += `<div class="card pad">
     <div class="grid grid-2">
       <div class="field"><label class="field-label">Full Name</label><input type="text" id="f_name" value="${user.name}"/></div>
@@ -830,18 +987,23 @@ function renderStudentProfile(user){
   </div>`;
 
   out += `<div class="grid grid-2" style="margin-top:14px;">
-    <div class="card pad">
-      <div class="name">Curriculum Vitae (CV)</div>
-      <div class="muted" style="margin:4px 0 10px;">${s.cv? "Uploaded" : "Not uploaded"}</div>
-      <button class="btn btn-secondary btn-sm" onclick="mockUpload('${s.id}','cv')">${s.cv?'Replace file':'Upload file'}</button>
-    </div>
-    <div class="card pad">
-      <div class="name">Academic Transcript</div>
-      <div class="muted" style="margin:4px 0 10px;">${s.transcript? "Uploaded" : "Not uploaded"}</div>
-      <button class="btn btn-secondary btn-sm" onclick="mockUpload('${s.id}','transcript')">${s.transcript?'Replace file':'Upload file'}</button>
-    </div>
+    ${uploadCard(s, "cv", "Curriculum Vitae (CV)")}
+    ${uploadCard(s, "transcript", "Academic Transcript")}
   </div>`;
   return out;
+}
+function uploadCard(s, field, label){
+  const f = s[field+"File"];
+  return `<div class="card pad">
+      <div class="name">${label}</div>
+      <div class="muted" style="margin:4px 0 10px;">${f ? `Uploaded: ${f.name}` : "Not uploaded"}</div>
+      <input type="file" id="${field}_upload_${s.id}" accept=".pdf,.doc,.docx" style="display:none;" onchange="handleFileUpload('${s.id}','${field}',this)"/>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-secondary btn-sm" onclick="document.getElementById('${field}_upload_${s.id}').click()">${f?'Replace file':'Upload file'}</button>
+        ${f ? `<button class="btn btn-ghost btn-sm" onclick="downloadStudentFile('${s.id}','${field}')">Download</button>
+        <button class="btn btn-ghost btn-sm" style="color:var(--rose);" onclick="removeStudentFile('${s.id}','${field}')">Remove</button>` : ""}
+      </div>
+    </div>`;
 }
 function saveProfile(sid){
   mutate(db=>{
@@ -857,9 +1019,54 @@ function saveProfile(sid){
   });
   toast("Profile saved — name and email updated.");
 }
-function mockUpload(sid, field){
-  mutate(db=>{ const s=db.students.find(x=>x.id===sid); s[field]=true; });
-  toast("File uploaded (demo — file contents aren't stored).");
+function handleFileUpload(sid, field, inputEl){
+  const file = inputEl.files && inputEl.files[0];
+  if(!file) return;
+  const maxBytes = 2 * 1024 * 1024;
+  if(file.size > maxBytes){
+    toast("That file is too large — please upload something under 2MB.");
+    inputEl.value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    mutate(db=>{
+      const s = db.students.find(x=>x.id===sid);
+      s[field] = true;
+      s[field+"File"] = { name: file.name, type: file.type, dataUrl: reader.result, uploadedAt: nowISO() };
+    });
+    toast(`${file.name} uploaded.`);
+  };
+  reader.onerror = () => toast("Couldn't read that file — please try again.");
+  reader.readAsDataURL(file);
+  inputEl.value = "";
+}
+function downloadStudentFile(sid, field){
+  const s = DB.students.find(x=>x.id===sid);
+  const f = s && s[field+"File"];
+  if(!f) return;
+  const link = document.createElement("a");
+  link.href = f.dataUrl;
+  link.download = f.name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+function removeStudentFile(sid, field){
+  mutate(db=>{
+    const s = db.students.find(x=>x.id===sid);
+    s[field] = false;
+    s[field+"File"] = null;
+  });
+  toast("File removed.");
+}
+function downloadATSTemplate(){
+  const link = document.createElement("a");
+  link.href = "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64," + ATS_CV_TEMPLATE_B64;
+  link.download = "ATS_CV_Template.docx";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 /* ---------------------------- Student: Browse & Apply ---------------------------- */
@@ -3010,7 +3217,7 @@ function renderReports(user){
   const tab = VIEW.params.tab || "company";
   const tabs = [["company","Company-wise interns"],["program","Program-wise"],["faculty","Faculty workload"],
     ["feedback","Employer feedback"],["performance","Student performance"],["placement","Placement stats"]];
-  let out = pageHeader("Module 10","Reports");
+  let out = pageHeader("Analytics","Reports");
   out += `<div class="tabs">${tabs.map(([k,l])=>`<button class="btn ${tab===k?'btn-primary':'btn-secondary'}" onclick="goto('reports',{tab:'${k}'})">${l}</button>`).join("")}</div>`;
 
   if(tab==="company"){
@@ -3065,6 +3272,126 @@ function tableView(rows){
     <tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${r[c]}</td>`).join("")}</tr>`).join("")}</tbody>
   </table></div>`;
 }
+
+/* ---------------------------- Liaison / HOD: Cloud Sync (Google Drive) ---------------------------- */
+const GAS_CODE = `// Internship Bridge — Google Apps Script backend
+// Saves the app's data as a single JSON file inside your Drive folder.
+//
+// SETUP:
+// 1. Go to script.google.com -> New project. Paste this whole file in,
+//    replacing the default code.
+// 2. Deploy -> New deployment -> type "Web app".
+//    - Execute as: Me
+//    - Who has access: Anyone
+// 3. Copy the Web app URL it gives you and paste it into the
+//    "Google Apps Script Web App URL" box on this page, then click Save.
+//
+// Your folder: https://drive.google.com/drive/folders/1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY
+
+const FOLDER_ID = "1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY";
+const FILE_NAME = "internship-bridge-data.json";
+
+function getOrCreateFile_() {
+  const folder = DriveApp.getFolderById(FOLDER_ID);
+  const files = folder.getFilesByName(FILE_NAME);
+  if (files.hasNext()) return files.next();
+  return folder.createFile(FILE_NAME, "{}", "application/json");
+}
+
+function doGet(e) {
+  const file = getOrCreateFile_();
+  const content = file.getBlob().getDataAsString() || "{}";
+  return ContentService.createTextOutput(content)
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  try {
+    const body = e.postData && e.postData.contents ? e.postData.contents : "{}";
+    JSON.parse(body); // validate before writing
+    const file = getOrCreateFile_();
+    file.setContent(body);
+    return ContentService.createTextOutput(JSON.stringify({ status: "ok" }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}`;
+function renderCloudSync(user){
+  const url = DB.settings?.cloudSyncUrl || "";
+  const status = DB.settings?.lastSyncStatus || "";
+  const lastSynced = DB.settings?.lastSyncedAt ? new Date(DB.settings.lastSyncedAt).toLocaleString() : "Never";
+  let out = pageHeader("Industry Liaison Office · Administrator","Cloud Sync (Google Drive)", "",
+    "Every save in Internship Bridge is pushed to a JSON file in your Google Drive folder through a small Google Apps Script. Set it up once below.");
+
+  out += `<div class="card pad" style="margin-bottom:14px;">
+    <div class="name" style="margin-bottom:6px;">Your Drive folder</div>
+    <a href="https://drive.google.com/drive/folders/1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY?usp=sharing" target="_blank" rel="noopener" class="mono" style="font-size:12.5px;">https://drive.google.com/drive/folders/1-4CCZyL5a6bewjJ532-4CuUz4MsAArBY</a>
+    <div class="muted" style="margin-top:6px; font-size:12.5px;">The data is stored there as a single file named <span class="mono">internship-bridge-data.json</span>.</div>
+  </div>`;
+
+  out += `<div class="card pad" style="margin-bottom:14px;">
+    <div class="name" style="margin-bottom:8px;">1. Deploy the Apps Script Web App</div>
+    <ol style="margin:0 0 10px 18px; padding:0; font-size:13px; line-height:1.7;">
+      <li>Open <a href="https://script.google.com" target="_blank" rel="noopener">script.google.com</a> and start a <b>New project</b>.</li>
+      <li>Delete the placeholder code and paste in the script below (it already points at your folder).</li>
+      <li><b>Deploy → New deployment → type "Web app"</b>. Set <i>Execute as: Me</i> and <i>Who has access: Anyone</i>, then click Deploy.</li>
+      <li>Copy the Web app URL Google gives you and paste it into the box in step 2 below, then click <b>Save &amp; connect</b>.</li>
+    </ol>
+    <textarea readonly rows="10" style="width:100%; font-family:ui-monospace,monospace; font-size:11.5px; padding:10px; border-radius:8px; border:1px solid var(--brand-100); background:var(--brand-25);" id="gasCode">${GAS_CODE.replace(/</g,"&lt;")}</textarea>
+    <button class="btn btn-secondary btn-sm" style="margin-top:8px;" onclick="copyGasCode()">Copy script</button>
+  </div>`;
+
+  out += `<div class="card pad" style="margin-bottom:14px;">
+    <div class="name" style="margin-bottom:8px;">2. Connect Internship Bridge to that Web App</div>
+    <div class="field"><label class="field-label">Google Apps Script Web App URL</label>
+      <input type="text" id="gas_url" value="${url}" placeholder="https://script.google.com/macros/s/xxxxx/exec"/>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-primary" onclick="saveCloudSyncUrl()">Save &amp; connect</button>
+      <button class="btn btn-secondary" onclick="pushToDrive(false)">Push data to Drive now</button>
+      <button class="btn btn-secondary" onclick="confirmPullFromDrive()">Pull latest from Drive</button>
+    </div>
+  </div>`;
+
+  out += `<div class="card pad">
+    <div class="name" style="margin-bottom:6px;">Status</div>
+    <div style="font-size:13px;">Connection: ${url ? badge("APPROVED","good") : badge("NOT_STARTED")}
+      ${status==="error" ? badge("REJECTED","bad") : ""}</div>
+    <div class="muted" style="margin-top:6px; font-size:12.5px;">Last synced to Drive: ${lastSynced}</div>
+    <div class="muted" style="margin-top:4px; font-size:12.5px;">Every time a record is created or edited anywhere in the app, the full dataset is automatically pushed to this file a moment later. Local storage always keeps a working copy too, so the app still works if Drive is briefly unreachable.</div>
+  </div>`;
+  return out;
+}
+function copyGasCode(){
+  const ta = document.getElementById("gasCode");
+  ta.select();
+  document.execCommand && document.execCommand("copy");
+  navigator.clipboard && navigator.clipboard.writeText(GAS_CODE).catch(()=>{});
+  toast("Script copied — paste it into script.google.com.");
+}
+function saveCloudSyncUrl(){
+  const url = document.getElementById("gas_url").value.trim();
+  mutate(db=>{
+    ensureSettings(db);
+    db.settings.cloudSyncUrl = url;
+  });
+  if(url){
+    toast("Saved. Connecting to Google Drive…");
+    pushToDrive(false);
+  } else {
+    toast("Cloud sync URL cleared.");
+  }
+}
+function confirmPullFromDrive(){
+  if(!confirm("This replaces everything currently in the app with whatever is saved in your Google Drive file. Continue?")) return;
+  pullFromDrive(false);
+}
+window.saveCloudSyncUrl = saveCloudSyncUrl;
+window.pushToDrive = pushToDrive;
+window.confirmPullFromDrive = confirmPullFromDrive;
+window.copyGasCode = copyGasCode;
 
 /* ---------------------------- Faculty: Assigned Interns ---------------------------- */
 function renderFacultyInterns(user){
