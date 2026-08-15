@@ -475,19 +475,33 @@ if(!window.storage){
   };
 }
 async function loadDB(){
+  let loaded = false;
+  // Try the normal persistent store first. Some file:// preview environments
+  // isolate or disable localStorage, so keep a per-tab sessionStorage backup.
   try{
     const res = await window.storage.get(STORAGE_KEY, true);
-    DB = JSON.parse(res.value);
-  }catch(e){
+    if(res && res.value){ DB = JSON.parse(res.value); loaded = true; }
+  }catch(e){}
+  if(!loaded){
+    try{
+      const raw = sessionStorage.getItem(STORAGE_KEY);
+      if(raw){ DB = JSON.parse(raw); loaded = true; }
+    }catch(e){}
+  }
+  if(!loaded){
     DB = seedDB();
     await saveDB();
   }
   ensureSettings(DB);
 }
 async function saveDB(){
-  try{
-    await window.storage.set(STORAGE_KEY, JSON.stringify(DB), true);
-  }catch(e){ console.error("Storage error", e); }
+  const raw = JSON.stringify(DB);
+  let saved = false;
+  try{ await window.storage.set(STORAGE_KEY, raw, true); saved = true; }catch(e){ console.warn("localStorage save failed", e); }
+  // sessionStorage survives F5 in the same browser tab and is especially useful
+  // when this app is opened from a local file/preview URL.
+  try{ sessionStorage.setItem(STORAGE_KEY, raw); saved = true; }catch(e){ console.warn("sessionStorage save failed", e); }
+  if(!saved) console.error("No browser storage available for the app database.");
 }
 
 /* ---------------------------- Google Drive Cloud Sync ----------------------------
@@ -734,57 +748,64 @@ const ROLE_LABEL = {
 };
 
 /* ---------------------------- Boot ---------------------------- */
-function getSavedSessionUserId(){
-  // localStorage survives a normal browser refresh. sessionStorage is a
-  // fallback for environments (notably some file:// previews) where
-  // localStorage may be restricted or cleared unexpectedly.
+// Keep the logged-in user across a page refresh (F5 / the browser's refresh
+// icon), but ONLY across a refresh — clicking "Log out" clears this and the
+// login screen stays put until someone logs in again. Stored as a stable
+// identity (id + email/regNo/name) rather than just the id, because a
+// Google Drive restore can regenerate ids for the same account.
+const SESSION_KEY = "internship-bridge-session-v3";
+function writeSession(user){
   try{
-    const id = localStorage.getItem("ib_session_user");
-    if(id) return id;
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      id: user?.id || null,
+      email: (user?.email||"").trim().toLowerCase(),
+      regNo: (user?.regNo||"").trim().toLowerCase(),
+      name: (user?.name||"").trim().toLowerCase(),
+    }));
   }catch(e){}
+}
+function readSession(){
   try{
-    const id = sessionStorage.getItem("ib_session_user");
-    if(id) return id;
-  }catch(e){}
-  return null;
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
 }
-function saveSessionUserId(id){
-  try{ localStorage.setItem("ib_session_user", id); }catch(e){}
-  try{ sessionStorage.setItem("ib_session_user", id); }catch(e){}
+function clearSession(){
+  try{ localStorage.removeItem(SESSION_KEY); }catch(e){}
+  // Also wipe any stale keys from earlier versions of this app.
+  try{ ["internship-bridge-session-v2","ib_session_user_v2","ib_session_user"].forEach(k=>localStorage.removeItem(k)); }catch(e){}
 }
-function clearSessionUserId(){
-  try{ localStorage.removeItem("ib_session_user"); }catch(e){}
-  try{ sessionStorage.removeItem("ib_session_user"); }catch(e){}
+function findUserBySession(saved){
+  if(!saved || !DB?.users) return null;
+  let u = null;
+  if(saved.id) u = DB.users.find(x=>String(x.id)===String(saved.id));
+  if(!u && saved.email) u = DB.users.find(x=>(x.email||"").trim().toLowerCase()===saved.email);
+  if(!u && saved.regNo){
+    const st = DB.students.find(x=>(x.regNo||"").trim().toLowerCase()===saved.regNo);
+    if(st) u = DB.users.find(x=>String(x.id)===String(st.userId));
+  }
+  if(!u && saved.name) u = DB.users.find(x=>(x.name||"").trim().toLowerCase()===saved.name);
+  return u || null;
 }
 async function boot(){
-  // Capture the session before any Drive/local DB work. A refresh must not
-  // turn into a logout merely because the cloud pull is slow or unavailable.
-  const savedId = getSavedSessionUserId();
+  try{ if((window.name||"").startsWith("IBSESSION")) window.name = ""; }catch(e){}
   await loadDB();
-  // If Drive sync is configured, pull the latest saved copy first so the
-  // same data follows the Liaison Office across browsers/devices. If Drive
-  // has nothing yet (first-ever run), push this browser's copy up so the
-  // Drive file gets initialized.
-  if(DB?.settings?.cloudSyncUrl){
-    const pulled = await pullFromDrive(true);
-    if(!pulled) pushToDrive(true).catch(()=>{});
-  }
-  // Keep existing records in sync: every internship with a supervisor gets its
-  // survey records so HOD / Liaison Survey Feedback is always complete.
+  // Pull Drive before resolving the session — a cloud copy can contain the
+  // same account under a different generated id, which findUserBySession()
+  // also matches on via email/regNo/name.
+  if(DB?.settings?.cloudSyncUrl){ const pulled=await pullFromDrive(true); if(!pulled) pushToDrive(true).catch(()=>{}); }
   ensureStudentProfiles(DB);
-  DB.internships.forEach(i=>syncInternshipLinks(DB, i.id));
+  DB.internships.forEach(i=>syncInternshipLinks(DB,i.id));
   await saveDB();
   startLiveJobsAutoRefresh();
-  // Restore the authenticated account after all DB/cloud initialization.
-  // Never require the user to re-enter credentials just because they refreshed.
-  const savedUser = savedId ? DB.users.find(u=>u.id===savedId) : null;
-  if(savedUser){ enterApp(savedUser, false); } else { renderLogin(); }
+  const savedUser = findUserBySession(readSession());
+  if(savedUser) enterApp(savedUser); else renderLogin();
 }
-function enterApp(user, persist=true){
-  VIEWER_ID = user.id;
-  if(persist) saveSessionUserId(user.id);
-  document.getElementById("loginScreen").style.display = "none";
-  document.getElementById("app").style.display = "flex";
+function enterApp(user){
+  VIEWER_ID=user.id;
+  writeSession(user);
+  document.getElementById("loginScreen").style.display="none";
+  document.getElementById("app").style.display="flex";
   goto("dashboard");
 }
 function renderLogin(){
@@ -792,7 +813,7 @@ function renderLogin(){
   document.getElementById("app").style.display = "none";
   document.getElementById("login_error").textContent = "";
 }
-function attemptLogin(){
+async function attemptLogin(){
   const idVal = (document.getElementById("login_id").value || "").trim().toLowerCase();
   const pwVal = document.getElementById("login_password").value || "";
   const errEl = document.getElementById("login_error");
@@ -806,11 +827,14 @@ function attemptLogin(){
   errEl.textContent = "";
   document.getElementById("login_id").value = "";
   document.getElementById("login_password").value = "";
+  // Persist the current database before entering the app. This prevents a
+  // refresh from falling back to seedDB when local/cloud storage is delayed.
+  await saveDB();
   enterApp(user);
 }
 function logout(){
   VIEWER_ID = null;
-  clearSessionUserId();
+  clearSession();
   VIEW = { name: null, params: {} };
   renderLogin();
 }
