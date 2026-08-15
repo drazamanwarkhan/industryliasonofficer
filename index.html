@@ -6,6 +6,10 @@
 <title>Internship Bridge — Industry Liaison Platform</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- Client-side CV parsing: extract text from PDF / DOCX resumes so ATS-style data can be read
+     straight off the uploaded file. Both run entirely in the browser — no file ever leaves it. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <style>
   :root{
     --ink:#12233B;
@@ -272,6 +276,41 @@ let VIEW = { name: null, params: {} };
 // single entry here since a dropdown can't offer the same label twice;
 // easy to split into two distinct programs by editing this array.)
 const PROGRAM_OPTIONS = ["BBA", "BS-BAP", "BS-Fintech"];
+
+// Keywords used to match each program (and, additively, each student's stated
+// preferred industry and any skills detected from their uploaded CV) against
+// internal postings and external listings — this is what "only show jobs in
+// their domain" filters on. Edit freely to tune matching.
+const PROGRAM_KEYWORDS = {
+  "BBA": ["business","management","marketing","sales","operations","administration","strategy","brand","hr","human resources","retail","supply chain","project management"],
+  "BS-BAP": ["business analytics","data","accounting","finance","audit","analytics","reporting","bookkeeping","business process","data analyst","power bi","excel","erp","sap"],
+  "BS-Fintech": ["fintech","finance","banking","blockchain","payments","financial technology","crypto","trading","risk","compliance","investment","insurtech"],
+};
+// General resume-skill vocabulary the CV parser scans for (beyond the program
+// keywords above), so "skills detected" isn't limited to program buzzwords.
+const CV_SKILL_VOCAB = [
+  "excel","powerpoint","word","sql","python","javascript","html","css","react",
+  "power bi","tableau","sap","quickbooks","salesforce","seo","google analytics",
+  "communication","leadership","teamwork","negotiation","budgeting","forecasting",
+  "financial modeling","bookkeeping","auditing","risk management","customer service",
+  "social media","content writing","project management","data analysis","market research",
+];
+// Every keyword that defines "this student's domain": their program's default
+// keywords, plus whatever they typed as preferred industry, plus any skills
+// the CV parser pulled off their uploaded resume.
+function studentDomainKeywords(s){
+  const kws = new Set();
+  (PROGRAM_KEYWORDS[s.program]||[]).forEach(k=>kws.add(k.toLowerCase()));
+  if(s.preferredIndustry){
+    s.preferredIndustry.split(/[,&/]+/).forEach(t=>{ t=t.trim().toLowerCase(); if(t) kws.add(t); });
+  }
+  (s.cvSkills||[]).forEach(k=>kws.add(k.toLowerCase()));
+  return Array.from(kws).filter(Boolean);
+}
+function matchesKeywords(text, keywords){
+  const t = (text||"").toLowerCase();
+  return keywords.some(k=>k && t.includes(k));
+}
 
 // Employer Evaluation Form — Internship Performance Assessment.
 // Rubric: 20 criteria, each rated 1–10 (total out of 200 — matches the
@@ -577,6 +616,17 @@ function ensureStudentProfiles(db){
 function ensureSettings(db){
   if(!db.settings) db.settings = { cloudSyncUrl:"", lastSyncedAt:null, lastSyncStatus:"" };
   if(!db.settings.cloudSyncUrl) db.settings.cloudSyncUrl = DEFAULT_CLOUD_SYNC_URL;
+  if(db.settings.adzunaAppId===undefined) db.settings.adzunaAppId = "";
+  if(db.settings.adzunaAppKey===undefined) db.settings.adzunaAppKey = "";
+  if(db.settings.apifyToken===undefined) db.settings.apifyToken = "";
+  if(db.settings.apifyActorId===undefined) db.settings.apifyActorId = "";
+  if(db.settings.apifyInputTemplate===undefined) db.settings.apifyInputTemplate = '{"searchQuery":"{{keyword}}","location":"{{country}}","maxItems":30}';
+  // Per-platform actor IDs — LinkedIn/Indeed/Glassdoor each need a different
+  // Apify actor since they're different scrapers. Migrate the old single
+  // apifyActorId (from before per-platform support) into "worldwide" so
+  // existing setups keep working.
+  if(!db.settings.apifyActors) db.settings.apifyActors = { worldwide:"", linkedin:"", indeed:"", glassdoor:"" };
+  if(db.settings.apifyActorId && !db.settings.apifyActors.worldwide) db.settings.apifyActors.worldwide = db.settings.apifyActorId;
 }
 async function mutate(fn){
   fn(DB);
@@ -678,6 +728,7 @@ async function boot(){
   ensureStudentProfiles(DB);
   DB.internships.forEach(i=>syncInternshipLinks(DB, i.id));
   await saveDB();
+  startLiveJobsAutoRefresh();
   renderLogin();
 }
 function renderLogin(){
@@ -990,6 +1041,17 @@ function renderStudentProfile(user){
     ${uploadCard(s, "cv", "Curriculum Vitae (CV)")}
     ${uploadCard(s, "transcript", "Academic Transcript")}
   </div>`;
+
+  if(s.cv && (s.cvSkills||[]).length>0){
+    out += `<div class="card pad" style="margin-top:14px; border-color:var(--brand-200); background:var(--brand-50);">
+      <div class="name">Detected from your CV</div>
+      <div class="muted" style="margin-top:2px;">Parsed automatically from the file you uploaded — used to match you to jobs in your domain.</div>
+      <div style="margin-top:10px; display:flex; gap:6px; flex-wrap:wrap;">${s.cvSkills.map(k=>`<span class="badge tone-neutral">${k}</span>`).join("")}</div>
+      <div class="muted" style="margin-top:10px; font-size:12px;">
+        ${s.cvEmail?`Email found: <span class="mono">${s.cvEmail}</span> &nbsp;·&nbsp; `:""}${s.cvPhone?`Phone found: <span class="mono">${s.cvPhone}</span>`:""}
+      </div>
+    </div>`;
+  }
   return out;
 }
 function uploadCard(s, field, label){
@@ -1019,6 +1081,80 @@ function saveProfile(sid){
   });
   toast("Profile saved — name and email updated.");
 }
+/* ---- CV parsing (ATS-style auto-fill) ----
+   Runs entirely in the browser: extracts raw text from the uploaded PDF/DOCX
+   using pdf.js / mammoth.js (loaded in <head>), then pulls out an email,
+   phone number, and any recognizable skill/domain keywords. Nothing is sent
+   anywhere — the file never leaves the browser tab. */
+if(typeof pdfjsLib !== "undefined"){
+  try{ pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"; }catch(e){}
+}
+async function extractTextFromFile(file){
+  const name = (file.name||"").toLowerCase();
+  if(name.endsWith(".pdf") || file.type==="application/pdf"){
+    if(typeof pdfjsLib==="undefined") throw new Error("PDF reader failed to load");
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    let text = "";
+    for(let i=1;i<=pdf.numPages;i++){
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map(it=>it.str).join(" ") + "\n";
+    }
+    return text;
+  }
+  if(name.endsWith(".docx")){
+    if(typeof mammoth==="undefined") throw new Error("DOCX reader failed to load");
+    const buf = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer: buf });
+    return result.value || "";
+  }
+  if(name.endsWith(".doc")){
+    throw new Error("legacy .doc can't be auto-read in-browser — upload PDF or DOCX for auto-fill");
+  }
+  return await file.text();
+}
+function extractFieldsFromText(text){
+  const emailMatch = text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  const phoneMatch = text.match(/(\+?\d[\d\s\-()]{7,}\d)/);
+  const lower = text.toLowerCase();
+  const vocab = new Set(CV_SKILL_VOCAB);
+  Object.values(PROGRAM_KEYWORDS).forEach(list=>list.forEach(k=>vocab.add(k)));
+  const skills = Array.from(vocab).filter(k=>lower.includes(k));
+  return {
+    email: emailMatch ? emailMatch[0] : null,
+    phone: phoneMatch ? phoneMatch[0].trim() : null,
+    skills,
+  };
+}
+async function parseAndApplyCV(sid, file){
+  toast("Reading your CV for auto-fill…");
+  try{
+    const text = await extractTextFromFile(file);
+    const { email, phone, skills } = extractFieldsFromText(text);
+    await mutate(db=>{
+      const s = db.students.find(x=>x.id===sid);
+      s.cvSkills = skills;
+      s.cvEmail = email;
+      s.cvPhone = phone;
+      s.cvParsedAt = nowISO();
+      const u = db.users.find(x=>x.id===s.userId);
+      if(u && !u.email && email) u.email = email;
+      if(!s.preferredIndustry && skills.length){
+        const ranked = Object.entries(PROGRAM_KEYWORDS)
+          .map(([prog,list])=>({ prog, hits: skills.filter(k=>list.includes(k)) }))
+          .sort((a,b)=>b.hits.length-a.hits.length);
+        if(ranked[0] && ranked[0].hits.length) s.preferredIndustry = ranked[0].hits.slice(0,3).join(", ");
+      }
+    });
+    toast(skills.length
+      ? `CV parsed — found ${skills.length} skill keyword(s) (${skills.slice(0,4).join(", ")}${skills.length>4?"…":""}), now used to match jobs to your domain.`
+      : "CV parsed, but no recognizable skill keywords were found in it.");
+  }catch(e){
+    console.error(e);
+    toast("File uploaded, but couldn't auto-read its contents (" + (e.message||"parsing error") + ").");
+  }
+}
 function handleFileUpload(sid, field, inputEl){
   const file = inputEl.files && inputEl.files[0];
   if(!file) return;
@@ -1036,6 +1172,7 @@ function handleFileUpload(sid, field, inputEl){
       s[field+"File"] = { name: file.name, type: file.type, dataUrl: reader.result, uploadedAt: nowISO() };
     });
     toast(`${file.name} uploaded.`);
+    if(field==="cv") parseAndApplyCV(sid, file);
   };
   reader.onerror = () => toast("Couldn't read that file — please try again.");
   reader.readAsDataURL(file);
@@ -1057,6 +1194,7 @@ function removeStudentFile(sid, field){
     const s = db.students.find(x=>x.id===sid);
     s[field] = false;
     s[field+"File"] = null;
+    if(field==="cv"){ s.cvSkills=[]; s.cvEmail=null; s.cvPhone=null; s.cvParsedAt=null; }
   });
   toast("File removed.");
 }
@@ -1077,14 +1215,30 @@ function renderBrowse(user){
       "This account has no student record — this tab shows open postings and an apply button when viewed as a student.",
       "postings","Employer Postings");
   }
-  const openPostings = DB.postings.filter(p=>p.isOpen && companyById(p.companyId).approvalStatus==="APPROVED");
-  let out = pageHeader("Student Portal","Available Internships");
+  const keywords = studentDomainKeywords(s);
+  const showAll = !!VIEW.params.showAllPostings;
+  const allOpen = DB.postings.filter(p=>p.isOpen && companyById(p.companyId).approvalStatus==="APPROVED");
+  const openPostings = (showAll || keywords.length===0) ? allOpen : allOpen.filter(p=>{
+    const c = companyById(p.companyId);
+    return matchesKeywords(`${p.title} ${p.department} ${p.description} ${c.industry}`, keywords);
+  });
+  const hiddenCount = allOpen.length - openPostings.length;
+
+  let out = pageHeader("Student Portal","Available Internships", "",
+    `Showing postings matched to your domain (<b>${s.program}</b>${s.preferredIndustry?` · ${s.preferredIndustry}`:""}${(s.cvSkills&&s.cvSkills.length)?` · skills from your CV`:""}).`);
+
   if(s.profileStatus!=="APPROVED"){
     out += `<div class="card pad" style="border-color:rgba(179,67,90,.4); background:rgba(179,67,90,.06); margin-bottom:14px;">
       Your profile must be approved by the Liaison Office before you can apply.
     </div>`;
   }
-  if(openPostings.length===0){ out += `<div class="card">${emptyState("No open postings right now","Check back soon.")}</div>`; return out; }
+  if(keywords.length>0 && hiddenCount>0){
+    out += `<div class="card pad" style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+      <div class="muted">${hiddenCount} posting(s) outside your domain are hidden.</div>
+      <button class="btn btn-ghost btn-sm" onclick="goto('browse',{showAllPostings:${showAll?'false':'true'}})">${showAll?'Show only my domain':'Show all postings'}</button>
+    </div>`;
+  }
+  if(openPostings.length===0){ out += `<div class="card">${emptyState(keywords.length>0&&!showAll?"No open postings in your domain right now":"No open postings right now","Try \"Show all postings\" above, or check back soon.")}</div>`; return out; }
 
   out += openPostings.map(p=>{
     const c = companyById(p.companyId);
@@ -1235,47 +1389,188 @@ const PLATFORMS = {
   indeed:     { label:"🔍 Indeed",           color:"#003A9B",          badge:"Indeed"     },
   glassdoor:  { label:"🏢 Glassdoor",        color:"#0CAA41",          badge:"Glassdoor"  },
   rozee:      { label:"🇵🇰 Rozee.pk",        color:"#E8272C",          badge:"Rozee.pk"   },
+  mustakbil:  { label:"🇵🇰 Mustakbil",       color:"#1565C0",          badge:"Mustakbil"  },
+  brightspyre:{ label:"🇵🇰 BrightSpyre",     color:"#E36A2E",          badge:"BrightSpyre"},
+  jobzpk:     { label:"🇵🇰 Jobz.pk",         color:"#2E7D32",          badge:"Jobz.pk"    },
+  pakjobsbank:{ label:"🇵🇰 Pakistan Jobs Bank",color:"#8B1E3F",        badge:"Pakistan Jobs Bank" },
+  njp:        { label:"🏛️ National Jobs Portal",color:"#00695C",       badge:"NJP Pakistan" },
+  google:     { label:"🔎 Google Jobs",      color:"#4285F4",          badge:"Google"     },
+  bayt:       { label:"🌙 Bayt.com",         color:"#00A19A",          badge:"Bayt.com"   },
+  monster:    { label:"👾 Monster",          color:"#6D3AE6",          badge:"Monster"    },
 };
+/* Platforms whose results only really make sense for one region, regardless
+   of the country picked in the shared filter bar — same idea already used
+   for Rozee.pk. Only drives a heads-up banner; the outbound link still works
+   either way since these sites geo-match on their own. */
+const REGION_LOCKED_PLATFORMS = {
+  rozee:  "Rozee.pk is a Pakistan-only job board",
+  mustakbil: "Mustakbil focuses on jobs in Pakistan",
+  brightspyre: "BrightSpyre focuses on jobs in Pakistan",
+  jobzpk: "Jobz.pk focuses on jobs in Pakistan",
+  pakjobsbank: "Pakistan Jobs Bank focuses on jobs in Pakistan",
+  njp: "The National Jobs Portal lists Government of Pakistan vacancies",
+  bayt:   "Bayt.com focuses on the Middle East & North Africa",
+};
+const PAKISTAN_PLATFORMS = new Set(["rozee","mustakbil","brightspyre","jobzpk","pakjobsbank","njp"]);
+const PAKISTAN_CITIES = [
+  "","Karachi","Lahore","Islamabad","Rawalpindi","Faisalabad","Gujranwala",
+  "Multan","Peshawar","Quetta","Hyderabad","Sialkot","Bahawalpur","Sargodha",
+  "Sukkur","Abbottabad","Gujrat","Jhelum","Mardan","Mirpur Khas"
+];
 
-function platformSearchURL(platform, keyword){
+/* Countries selectable across every job tab. `indeed` is the ccTLD subdomain
+   Indeed serves that country from; `adzuna` is the Adzuna country code (only
+   set where Adzuna actually operates — used by the optional live Adzuna
+   source below). Rozee.pk is a Pakistan-only board, so it stays pointed at
+   Pakistan regardless of the picked country. */
+const COUNTRIES = [
+  { name:"Worldwide / Remote",   indeed:"www", adzuna:"" },
+  { name:"United States",        indeed:"www", adzuna:"us" },
+  { name:"United Kingdom",       indeed:"uk",  adzuna:"gb" },
+  { name:"Canada",               indeed:"ca",  adzuna:"ca" },
+  { name:"Australia",            indeed:"au",  adzuna:"au" },
+  { name:"India",                indeed:"in",  adzuna:"in" },
+  { name:"Pakistan",             indeed:"pk",  adzuna:"" },
+  { name:"United Arab Emirates", indeed:"ae",  adzuna:"" },
+  { name:"Germany",              indeed:"de",  adzuna:"de" },
+  { name:"France",               indeed:"fr",  adzuna:"fr" },
+  { name:"Netherlands",          indeed:"nl",  adzuna:"nl" },
+  { name:"Singapore",            indeed:"sg",  adzuna:"" },
+  { name:"South Africa",         indeed:"za",  adzuna:"za" },
+  { name:"Italy",                indeed:"it",  adzuna:"it" },
+  { name:"Spain",                indeed:"es",  adzuna:"es" },
+  { name:"Brazil",               indeed:"br",  adzuna:"br" },
+  { name:"Mexico",               indeed:"mx",  adzuna:"mx" },
+  { name:"New Zealand",          indeed:"nz",  adzuna:"nz" },
+  { name:"Poland",               indeed:"pl",  adzuna:"pl" },
+  { name:"Saudi Arabia",         indeed:"sa",  adzuna:"" },
+  { name:"Nigeria",              indeed:"ng",  adzuna:"" },
+];
+function countryByName(name){ return COUNTRIES.find(c=>c.name===name) || COUNTRIES[0]; }
+
+function jobPathSlug(value){
+  return (value||"").toLowerCase().trim().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"");
+}
+function jobPathTitle(value){
+  return (value||"").trim().split(/\s+/).map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join("%20");
+}
+const ROZEE_CITY_IDS = {
+  lahore:"1185", karachi:"1184", islamabad:"1180", rawalpindi:"1190",
+  faisalabad:"1181", gujranwala:"1182", hyderabad:"1183", multan:"1187",
+  peshawar:"1188", quetta:"1189"
+};
+function mustakbilFieldSlug(value){
+  const v=(value||"").toLowerCase();
+  if(/digital marketing|seo|social media|content marketing/.test(v)) return "digital-marketing";
+  if(/software|developer|programming|web development|computer/.test(v)) return "computer-software";
+  if(/information technology|\bit\b|network|cyber|data|analytics/.test(v)) return "information-technology";
+  if(/account|audit|finance|banking|tax/.test(v)) return "accounting";
+  if(/human resource|\bhr\b|recruit|talent/.test(v)) return "human-resources";
+  if(/sales|business development/.test(v)) return "sales";
+  if(/graphic|ui.?ux|design|creative/.test(v)) return "graphic-design";
+  if(/supply chain|logistics|procurement/.test(v)) return "supply-chain";
+  if(/engineer/.test(v)) return "engineer";
+  if(/education|teacher|teaching/.test(v)) return "education";
+  if(/admin|office/.test(v)) return "administrative";
+  return "";
+}
+
+function platformSearchURL(platform, keyword, countryName, locationText){
   const k = encodeURIComponent(keyword||"internship");
-  if(platform==="linkedin")  return `https://www.linkedin.com/jobs/search/?keywords=${k}&f_TPR=r604800`;
-  if(platform==="indeed")    return `https://pk.indeed.com/jobs?q=${k}&l=Pakistan`;
-  if(platform==="glassdoor") return `https://www.glassdoor.com/Job/pakistan-${k}-jobs-SRCH_IL.0,8_IN188_KE9,${9+keyword.length}.htm`;
-  if(platform==="rozee")     return `https://www.rozee.pk/job/jsearch/q/${k}`;
+  const country = countryByName(countryName || JOB_SEARCH_STATE.country);
+  const isWorldwide = country.name === "Worldwide / Remote";
+  const selectedLocation = (locationText || "").trim() || (isWorldwide ? "" : country.name);
+  if(platform==="linkedin"){
+    // LinkedIn's own search accepts a free-text location param — no API/key needed.
+    const loc = selectedLocation ? `&location=${encodeURIComponent(selectedLocation)}` : "";
+    return `https://www.linkedin.com/jobs/search/?keywords=${k}${loc}&f_TPR=r604800`;
+  }
+  if(platform==="indeed"){
+    // Indeed runs a separate ccTLD subdomain per country (uk.indeed.com, de.indeed.com, ...).
+    const sub = isWorldwide ? "www" : country.indeed;
+    const l = selectedLocation ? `&l=${encodeURIComponent(selectedLocation)}` : "";
+    return `https://${sub}.indeed.com/jobs?q=${k}${l}`;
+  }
+  if(platform==="glassdoor"){
+    // Glassdoor's internal location IDs aren't guessable per-country, so we
+    // fall back to its generic keyword search and fold the country name into
+    // the query text when one is picked, letting Glassdoor's own geo-match handle it.
+    const q = selectedLocation ? encodeURIComponent(`${keyword||"internship"} ${selectedLocation}`) : k;
+    return `https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${q}`;
+  }
+  if(platform==="rozee"){
+    const cityName = (locationText||"").trim().toLowerCase();
+    const cityId = ROZEE_CITY_IDS[cityName];
+    // Rozee uses /fc/<numeric city id> for its native city filter. When the
+    // city is not in the verified mapping, keep it in the keyword query so it
+    // still affects results instead of silently being discarded.
+    const terms = cityId ? (keyword||"internship") : [keyword||"internship", cityName].filter(Boolean).join(" ");
+    return `https://www.rozee.pk/job/jsearch/q/${encodeURIComponent(terms)}${cityId?`/fc/${cityId}`:""}`;
+  }
+  if(platform==="mustakbil"){
+    // Mustakbil's query endpoint can show an external-navigation interstitial.
+    // Its stable public result pages encode city, work type and field in the
+    // path, e.g. /lahore/internship/digital-marketing.
+    const city = jobPathSlug(locationText);
+    let rawField = (JOB_SEARCH_STATE.keyword || (JOB_SEARCH_STATE.industry!=="All" ? JOB_SEARCH_STATE.industry : "") || keyword || "").toLowerCase();
+    let type = JOB_SEARCH_STATE.type!=="All" ? JOB_SEARCH_STATE.type.toLowerCase() : "";
+    if(!type && /\b(intern|internship|internships)\b/.test(rawField)) type="internship";
+    else if(!type && /\bpart[ -]?time\b/.test(rawField)) type="part-time";
+    else if(!type && /\b(remote|online)\b/.test(rawField)) type="online";
+    else if(!type && /\bfull[ -]?time\b/.test(rawField)) type="full-time";
+    type = type.replace(/^remote$/,"online").replace(/^intern(ship)?s?$/,"internship");
+    rawField = rawField.replace(/\b(intern|internship|internships|part[ -]?time|full[ -]?time|remote|online|paid|unpaid|jobs?)\b/g," ").replace(/\s+/g," ").trim();
+    const field = mustakbilFieldSlug(`${rawField} ${JOB_SEARCH_STATE.industry!=="All"?JOB_SEARCH_STATE.industry:""}`);
+    if(!["internship","part-time","online","full-time"].includes(jobPathSlug(type))) type="";
+    const parts = ["https://www.mustakbil.com/jobs/pakistan", city, jobPathSlug(type), field].filter(Boolean);
+    return parts.join("/");
+  }
+  if(platform==="brightspyre"){
+    return `https://resume.brightspyre.com/jobs?q=${encodeURIComponent(keyword||"internship")}&location=${encodeURIComponent((locationText||"").trim())}`;
+  }
+  if(platform==="jobzpk"){
+    const role = jobPathSlug(keyword||"internship") || "internship";
+    const city = jobPathSlug(locationText);
+    return `https://www.jobz.pk/${role}-jobs${city?`-in-${city}`:""}/`;
+  }
+  if(platform==="pakjobsbank"){
+    const city = jobPathTitle(locationText);
+    const base = city ? `https://www.pakistanjobsbank.com/Loc/${city}/` : "https://www.pakistanjobsbank.com/";
+    return `${base}?q=${encodeURIComponent(keyword||"internship")}`;
+  }
+  if(platform==="njp"){
+    const loc = (locationText||"").trim();
+    return `https://www.njp.gov.pk/jobs/live?q=${encodeURIComponent(keyword||"internship")}&location=${encodeURIComponent(loc)}`;
+  }
+  if(platform==="google"){
+    // Google has no free, keyless public API for job listings, so this opens
+    // Google's own live search results (often surfacing the "Google for Jobs"
+    // panel) for the query — a real page, not scraped/fabricated data.
+    const q = selectedLocation ? `${keyword||"internship"} jobs in ${selectedLocation}` : `${keyword||"internship"} jobs`;
+    return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+  }
+  if(platform==="bayt"){
+    const q = encodeURIComponent([keyword||"internship", selectedLocation].filter(Boolean).join(" "));
+    return `https://www.bayt.com/en/international/jobs/?keyword=${q}`;
+  }
+  if(platform==="monster"){
+    const where = selectedLocation ? `&where=${encodeURIComponent(selectedLocation)}` : "";
+    return `https://www.monster.com/jobs/search?q=${k}${where}`;
+  }
   return "#";
 }
 
-/* External job seed — one list reused across LinkedIn / Indeed / Glassdoor / Rozee tabs
-   (each tab opens the appropriate platform URL on Apply) */
-const EXT_JOBS = [
-  { id:"ej1",  title:"Marketing Intern",              company:"Unilever Pakistan",    location:"Karachi",    type:"Internship",  industry:"Marketing",  salary:"PKR 20,000/mo", posted:"2 days ago",   desc:"Support the brand team on digital campaigns, social media calendars, and consumer research reports.",                                        tags:["Marketing","Social Media","Brand"],         urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Marketing+Intern+Pakistan",            indeed:"https://pk.indeed.com/jobs?q=Marketing+Intern",            glassdoor:"https://www.glassdoor.com/Job/pakistan-marketing-intern-jobs-SRCH_IL.0,8_IN188.htm",            rozee:"https://www.rozee.pk/job/jsearch/q/marketing+intern" }},
-  { id:"ej2",  title:"Data Analytics Intern",         company:"Systems Limited",      location:"Lahore",     type:"Internship",  industry:"Technology", salary:"PKR 25,000/mo", posted:"5 days ago",   desc:"Build dashboards, run SQL queries, and create data visualizations for enterprise clients. Python & Power BI a plus.",                           tags:["Data Analytics","SQL","Python","Power BI"], urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Data+Analytics+Intern+Pakistan",           indeed:"https://pk.indeed.com/jobs?q=Data+Analytics+Intern",           glassdoor:"https://www.glassdoor.com/Job/pakistan-data-analytics-intern-jobs-SRCH_IL.0,8_IN188.htm",           rozee:"https://www.rozee.pk/job/jsearch/q/data+analytics+intern" }},
-  { id:"ej3",  title:"Software Engineering Intern",   company:"10Pearls",             location:"Karachi",    type:"Internship",  industry:"Technology", salary:"PKR 30,000/mo", posted:"1 week ago",   desc:"Work on real-world software projects using React, Node.js, and cloud technologies in an agile environment.",                                   tags:["React","Node.js","Cloud","Agile"],          urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Software+Engineering+Intern+Pakistan",      indeed:"https://pk.indeed.com/jobs?q=Software+Engineer+Intern",        glassdoor:"https://www.glassdoor.com/Job/pakistan-software-engineer-intern-jobs-SRCH_IL.0,8_IN188.htm",      rozee:"https://www.rozee.pk/job/jsearch/q/software+engineering+intern" }},
-  { id:"ej4",  title:"Finance Intern",                company:"HBL",                  location:"Karachi",    type:"Internship",  industry:"Finance",    salary:"PKR 22,000/mo", posted:"3 days ago",   desc:"Assist corporate finance team with financial modelling, investment analysis, and portfolio management.",                                       tags:["Finance","Financial Modelling","Investment"],urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Finance+Intern+HBL+Pakistan",               indeed:"https://pk.indeed.com/jobs?q=Finance+Intern",                  glassdoor:"https://www.glassdoor.com/Job/pakistan-finance-intern-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/finance+intern" }},
-  { id:"ej5",  title:"HR & Talent Acquisition Intern",company:"Jazz (PMCL)",          location:"Islamabad",  type:"Internship",  industry:"Telecom",    salary:"PKR 20,000/mo", posted:"4 days ago",   desc:"Support people operations: recruitment, onboarding, engagement surveys, and HR data management.",                                              tags:["HR","Talent Acquisition","Engagement"],     urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=HR+Intern+Pakistan",                      indeed:"https://pk.indeed.com/jobs?q=HR+Intern",                       glassdoor:"https://www.glassdoor.com/Job/pakistan-hr-intern-jobs-SRCH_IL.0,8_IN188.htm",                      rozee:"https://www.rozee.pk/job/jsearch/q/hr+intern" }},
-  { id:"ej6",  title:"Graphic Design Intern",         company:"Designist Studio",     location:"Karachi",    type:"Internship",  industry:"Creative",   salary:"PKR 18,000/mo", posted:"1 day ago",    desc:"Create visual assets for social media, web, and print campaigns. Adobe Creative Suite proficiency required.",                                  tags:["Graphic Design","Adobe CC","UI/UX"],        urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Graphic+Design+Intern+Pakistan",           indeed:"https://pk.indeed.com/jobs?q=Graphic+Design+Intern",           glassdoor:"https://www.glassdoor.com/Job/pakistan-graphic-design-intern-jobs-SRCH_IL.0,8_IN188.htm",           rozee:"https://www.rozee.pk/job/jsearch/q/graphic+design+intern" }},
-  { id:"ej7",  title:"Business Development Intern",   company:"Careem",               location:"Lahore",     type:"Internship",  industry:"Technology", salary:"PKR 22,000/mo", posted:"6 days ago",   desc:"Conduct market research, build partnership proposals, and identify new growth opportunities across Pakistan.",                                  tags:["Business Development","Market Research"],   urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Business+Development+Intern+Pakistan",      indeed:"https://pk.indeed.com/jobs?q=Business+Development+Intern",     glassdoor:"https://www.glassdoor.com/Job/pakistan-business-development-intern-jobs-SRCH_IL.0,8_IN188.htm",    rozee:"https://www.rozee.pk/job/jsearch/q/business+development+intern" }},
-  { id:"ej8",  title:"Supply Chain Intern",           company:"Engro Corporation",    location:"Karachi",    type:"Internship",  industry:"Manufacturing",salary:"PKR 20,000/mo",posted:"2 days ago",  desc:"Analyse logistics data and help optimise procurement and inventory management processes.",                                                      tags:["Supply Chain","Logistics","Procurement"],   urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Supply+Chain+Intern+Pakistan",              indeed:"https://pk.indeed.com/jobs?q=Supply+Chain+Intern",             glassdoor:"https://www.glassdoor.com/Job/pakistan-supply-chain-intern-jobs-SRCH_IL.0,8_IN188.htm",             rozee:"https://www.rozee.pk/job/jsearch/q/supply+chain+intern" }},
-  { id:"ej9",  title:"Content Writing Intern",        company:"TechJuice",            location:"Remote",     type:"Remote",      industry:"Media",      salary:"PKR 15,000/mo", posted:"3 days ago",   desc:"Write engaging articles, blog posts, and social media copy about tech and startups in Pakistan.",                                              tags:["Content Writing","Blogging","Social Media"],urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Content+Writing+Intern",                   indeed:"https://pk.indeed.com/jobs?q=Content+Writer+Intern",           glassdoor:"https://www.glassdoor.com/Job/pakistan-content-writer-intern-jobs-SRCH_IL.0,8_IN188.htm",          rozee:"https://www.rozee.pk/job/jsearch/q/content+writing+intern" }},
-  { id:"ej10", title:"Accounting Intern",             company:"KPMG Pakistan",        location:"Karachi",    type:"Internship",  industry:"Finance",    salary:"PKR 20,000/mo", posted:"1 week ago",   desc:"Assist with audit engagements, financial statements, and tax compliance for corporate clients.",                                               tags:["Accounting","Audit","Tax"],                 urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Accounting+Intern+Pakistan",               indeed:"https://pk.indeed.com/jobs?q=Accounting+Intern",               glassdoor:"https://www.glassdoor.com/Job/pakistan-accounting-intern-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/accounting+intern" }},
-  { id:"ej11", title:"Digital Marketing Executive",   company:"Foodpanda Pakistan",   location:"Karachi",    type:"Full-time",   industry:"Marketing",  salary:"PKR 60,000/mo", posted:"2 days ago",   desc:"Lead digital marketing campaigns, manage paid ads (Google/Meta), and grow our online presence.",                                              tags:["Digital Marketing","Google Ads","SEO"],     urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Digital+Marketing+Executive+Pakistan",      indeed:"https://pk.indeed.com/jobs?q=Digital+Marketing+Executive",     glassdoor:"https://www.glassdoor.com/Job/pakistan-digital-marketing-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/digital+marketing+executive" }},
-  { id:"ej12", title:"Financial Analyst",             company:"MCB Bank",             location:"Lahore",     type:"Full-time",   industry:"Finance",    salary:"PKR 80,000/mo", posted:"4 days ago",   desc:"Analyse financial statements, build forecasting models, and support senior management with strategic decisions.",                               tags:["Financial Analysis","Forecasting","Excel"],  urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Financial+Analyst+Pakistan",               indeed:"https://pk.indeed.com/jobs?q=Financial+Analyst",               glassdoor:"https://www.glassdoor.com/Job/pakistan-financial-analyst-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/financial+analyst" }},
-  { id:"ej13", title:"React Developer Intern",        company:"Arbisoft",             location:"Lahore",     type:"Internship",  industry:"Technology", salary:"PKR 35,000/mo", posted:"3 days ago",   desc:"Build responsive UI components with React and TypeScript. Collaborate with a senior dev team on live products.",                               tags:["React","TypeScript","Frontend"],             urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=React+Developer+Intern+Pakistan",            indeed:"https://pk.indeed.com/jobs?q=React+Developer+Intern",          glassdoor:"https://www.glassdoor.com/Job/pakistan-react-developer-intern-jobs-SRCH_IL.0,8_IN188.htm",          rozee:"https://www.rozee.pk/job/jsearch/q/react+developer+intern" }},
-  { id:"ej14", title:"Operations Intern",             company:"Daraz.pk",             location:"Karachi",    type:"Internship",  industry:"E-Commerce", salary:"PKR 18,000/mo", posted:"5 days ago",   desc:"Support daily operations, vendor management, and logistics coordination for one of Pakistan's largest e-commerce platforms.",                  tags:["Operations","E-Commerce","Logistics"],      urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Operations+Intern+Daraz+Pakistan",           indeed:"https://pk.indeed.com/jobs?q=Operations+Intern",               glassdoor:"https://www.glassdoor.com/Job/pakistan-operations-intern-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/operations+intern" }},
-  { id:"ej15", title:"SEO & Content Intern",          company:"Digital Media Pro",    location:"Remote",     type:"Remote",      industry:"Marketing",  salary:"PKR 15,000/mo", posted:"1 day ago",    desc:"Optimise web content for search engines, conduct keyword research, and write SEO-friendly blog articles.",                                     tags:["SEO","Content","Keyword Research"],          urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=SEO+Intern+Pakistan",                       indeed:"https://pk.indeed.com/jobs?q=SEO+Intern",                      glassdoor:"https://www.glassdoor.com/Job/pakistan-seo-intern-jobs-SRCH_IL.0,8_IN188.htm",                      rozee:"https://www.rozee.pk/job/jsearch/q/seo+intern" }},
-  { id:"ej16", title:"Banking Intern – Corporate",    company:"Meezan Bank",          location:"Karachi",    type:"Internship",  industry:"Finance",    salary:"PKR 22,000/mo", posted:"2 days ago",   desc:"Rotate through corporate banking, trade finance, and treasury departments to gain broad banking exposure.",                                    tags:["Banking","Corporate Finance","Trade"],       urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Banking+Intern+Meezan+Pakistan",              indeed:"https://pk.indeed.com/jobs?q=Banking+Intern",                  glassdoor:"https://www.glassdoor.com/Job/pakistan-banking-intern-jobs-SRCH_IL.0,8_IN188.htm",                  rozee:"https://www.rozee.pk/job/jsearch/q/banking+intern" }},
-  { id:"ej17", title:"UI/UX Design Intern",           company:"Systems Limited",      location:"Lahore",     type:"Internship",  industry:"Technology", salary:"PKR 25,000/mo", posted:"1 week ago",   desc:"Design user interfaces and experiences for enterprise software products using Figma. Portfolio required.",                                     tags:["UI/UX","Figma","Wireframing"],               urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=UX+Design+Intern+Pakistan",                  indeed:"https://pk.indeed.com/jobs?q=UI+UX+Intern",                    glassdoor:"https://www.glassdoor.com/Job/pakistan-ui-ux-intern-jobs-SRCH_IL.0,8_IN188.htm",                     rozee:"https://www.rozee.pk/job/jsearch/q/ux+designer+intern" }},
-  { id:"ej18", title:"Cybersecurity Intern",          company:"PTCL",                 location:"Islamabad",  type:"Internship",  industry:"Technology", salary:"PKR 28,000/mo", posted:"4 days ago",   desc:"Assist the security operations centre with monitoring network traffic, analysing threats, and incident response.",                             tags:["Cybersecurity","SOC","Network Security"],    urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Cybersecurity+Intern+Pakistan",               indeed:"https://pk.indeed.com/jobs?q=Cybersecurity+Intern",            glassdoor:"https://www.glassdoor.com/Job/pakistan-cybersecurity-intern-jobs-SRCH_IL.0,8_IN188.htm",            rozee:"https://www.rozee.pk/job/jsearch/q/cybersecurity+intern" }},
-  { id:"ej19", title:"Project Management Intern",     company:"Netsol Technologies",  location:"Lahore",     type:"Internship",  industry:"Technology", salary:"PKR 22,000/mo", posted:"3 days ago",   desc:"Support project managers in planning, tracking, and delivering software projects on time and within budget.",                                  tags:["Project Management","Agile","JIRA"],         urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Project+Management+Intern+Pakistan",          indeed:"https://pk.indeed.com/jobs?q=Project+Management+Intern",       glassdoor:"https://www.glassdoor.com/Job/pakistan-project-management-intern-jobs-SRCH_IL.0,8_IN188.htm",       rozee:"https://www.rozee.pk/job/jsearch/q/project+management+intern" }},
-  { id:"ej20", title:"Procurement Intern",            company:"Fauji Fertilizer",     location:"Rawalpindi", type:"Internship",  industry:"Manufacturing",salary:"PKR 20,000/mo",posted:"6 days ago",  desc:"Assist the procurement team in vendor evaluation, purchase orders, and supplier negotiations.",                                               tags:["Procurement","Vendor Management","Supply"],  urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Procurement+Intern+Pakistan",                 indeed:"https://pk.indeed.com/jobs?q=Procurement+Intern",              glassdoor:"https://www.glassdoor.com/Job/pakistan-procurement-intern-jobs-SRCH_IL.0,8_IN188.htm",               rozee:"https://www.rozee.pk/job/jsearch/q/procurement+intern" }},
-  { id:"ej21", title:"Customer Experience Intern",    company:"Bank Alfalah",         location:"Karachi",    type:"Internship",  industry:"Finance",    salary:"PKR 18,000/mo", posted:"2 days ago",   desc:"Work in the CX team to analyse customer feedback, resolve complaints, and improve service quality metrics.",                                  tags:["Customer Experience","CX","Banking"],        urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Customer+Experience+Intern+Pakistan",         indeed:"https://pk.indeed.com/jobs?q=Customer+Experience+Intern",      glassdoor:"https://www.glassdoor.com/Job/pakistan-customer-experience-intern-jobs-SRCH_IL.0,8_IN188.htm",      rozee:"https://www.rozee.pk/job/jsearch/q/customer+experience+intern" }},
-  { id:"ej22", title:"Research Analyst Intern",       company:"IGI Securities",       location:"Karachi",    type:"Internship",  industry:"Finance",    salary:"PKR 25,000/mo", posted:"5 days ago",   desc:"Conduct equity research, write sector reports, and support the investment advisory team with financial models.",                               tags:["Equity Research","Finance","Modelling"],     urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Research+Analyst+Intern+Pakistan",             indeed:"https://pk.indeed.com/jobs?q=Research+Analyst+Intern",         glassdoor:"https://www.glassdoor.com/Job/pakistan-research-analyst-intern-jobs-SRCH_IL.0,8_IN188.htm",         rozee:"https://www.rozee.pk/job/jsearch/q/research+analyst+intern" }},
-  { id:"ej23", title:"Video Production Intern",       company:"Geo TV",               location:"Karachi",    type:"Internship",  industry:"Media",      salary:"PKR 18,000/mo", posted:"1 week ago",   desc:"Assist with pre-production, filming, and editing segments for broadcast and digital media content.",                                           tags:["Video Editing","Adobe Premiere","Media"],    urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Video+Production+Intern+Pakistan",             indeed:"https://pk.indeed.com/jobs?q=Video+Production+Intern",         glassdoor:"https://www.glassdoor.com/Job/pakistan-video-production-intern-jobs-SRCH_IL.0,8_IN188.htm",         rozee:"https://www.rozee.pk/job/jsearch/q/video+production+intern" }},
-  { id:"ej24", title:"Java Backend Intern",           company:"Afiniti",              location:"Islamabad",  type:"Internship",  industry:"Technology", salary:"PKR 35,000/mo", posted:"3 days ago",   desc:"Develop and maintain Java microservices, integrate REST APIs, and write unit tests for enterprise applications.",                               tags:["Java","Spring Boot","REST API"],             urls:{ linkedin:"https://www.linkedin.com/jobs/search/?keywords=Java+Backend+Intern+Pakistan",                indeed:"https://pk.indeed.com/jobs?q=Java+Developer+Intern",           glassdoor:"https://www.glassdoor.com/Job/pakistan-java-developer-intern-jobs-SRCH_IL.0,8_IN188.htm",           rozee:"https://www.rozee.pk/job/jsearch/q/java+backend+intern" }},
-];
+/* External platforms intentionally contain no bundled/sample jobs. Searches
+   open each provider's current results using the fields selected below. */
 
-let JOB_SEARCH_STATE = { keyword:"", location:"All", type:"All", industry:"All", salary:"All", platform:"university", bookmarks:new Set(), page:0 };
+let JOB_SEARCH_STATE = { keyword:"", location:"", type:"All", industry:"All", salary:"All", platform:"university", bookmarks:new Set(), page:0, domainOnly:true, country:"Worldwide / Remote" };
+// Live worldwide results (fetched client-side from real job-board APIs), kept
+// outside DB/storage since these are third-party results the platform
+// doesn't own — never persisted or synced.
+let WORLDWIDE_JOBS_STATE = { status:"idle", jobs:[], error:null };
+let ADZUNA_FORM_OPEN = false;
+let APIFY_FORM_OPEN = false;
+let EXT_APIFY_FORM_OPEN = null; // holds platform key ('linkedin'|'indeed'|'glassdoor') or null
 const EXT_PAGE_SIZE = 6;
 function renderJobPostings(user){
   const s = studentByUserId(user.id);
@@ -1285,7 +1580,8 @@ function renderJobPostings(user){
       "This tab is available to students and administrators only.",
       "students","Manage Students");
   }
-  const plat = VIEW.params.jobPlatform || "university";
+  const requestedPlatform = VIEW.params.jobPlatform || "university";
+  const plat = PLATFORMS[requestedPlatform] ? requestedPlatform : "university";
   const portalLabel = isAdmin ? (user.role==="HOD" ? "Head of Department" : "Industry Liaison Office") : "Student Portal";
   let out = pageHeader(portalLabel, "Job Postings", "", "Browse and apply for internships and jobs across multiple platforms.");
 
@@ -1300,6 +1596,396 @@ function renderJobPostings(user){
 
   if(plat==="university") return out + renderUniversityJobsTab(user, s, isAdmin);
   return out + renderExternalJobsTab(user, s, isAdmin, plat);
+}
+function toggleJobDomainFilter(){
+  JOB_SEARCH_STATE.domainOnly = !JOB_SEARCH_STATE.domainOnly;
+  render();
+}
+/* ---- Worldwide (Live) tab: real fetches to free, no-key, CORS-enabled job
+   board APIs — combined from multiple providers so "worldwide" isn't just
+   one source's inventory. Runs entirely client-side in the visitor's own
+   browser; if a source is blocked (offline, corporate proxy, the API
+   changing its CORS policy, etc.) it's skipped rather than failing the
+   whole search. */
+const WORLDWIDE_JOB_SOURCES = [
+  {
+    name: "RemoteOK",
+    url: "https://remoteok.com/api",
+    parseList: (data)=> Array.isArray(data) ? data.filter(d=>d && d.id && (d.position||d.title)) : [],
+    normalize: (raw)=>({
+      id: "remoteok_"+raw.id,
+      title: raw.position || raw.title || "Untitled role",
+      company: raw.company || "Unknown company",
+      location: raw.location || "Remote / Worldwide",
+      tags: Array.isArray(raw.tags) ? raw.tags : [],
+      description: (raw.description || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.url || raw.apply_url || "#",
+      posted: raw.date ? fmtDate(raw.date) : "",
+      source: "RemoteOK",
+    }),
+  },
+  {
+    name: "Arbeitnow",
+    url: "https://www.arbeitnow.com/api/job-board-api",
+    parseList: (data)=> Array.isArray(data?.data) ? data.data : [],
+    normalize: (raw)=>({
+      id: "arbeitnow_"+(raw.slug || raw.url || Math.random()),
+      title: raw.title || "Untitled role",
+      company: raw.company_name || "Unknown company",
+      location: raw.location || (raw.remote ? "Remote / Worldwide" : "Worldwide"),
+      tags: Array.isArray(raw.tags) ? raw.tags : (Array.isArray(raw.job_types) ? raw.job_types : []),
+      description: (raw.description || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.url || "#",
+      posted: raw.created_at ? fmtDate(raw.created_at*1000) : "",
+      source: "Arbeitnow",
+    }),
+  },
+  {
+    name: "Jobicy",
+    url: "https://jobicy.com/api/v2/remote-jobs?count=50",
+    parseList: (data)=> Array.isArray(data?.jobs) ? data.jobs : [],
+    normalize: (raw)=>({
+      id: "jobicy_"+(raw.id || raw.url || Math.random()),
+      title: raw.jobTitle || "Untitled role",
+      company: raw.companyName || "Unknown company",
+      location: raw.jobGeo || "Remote / Worldwide",
+      tags: Array.isArray(raw.jobIndustry) ? raw.jobIndustry : (Array.isArray(raw.jobType) ? raw.jobType : []),
+      description: (raw.jobExcerpt || raw.jobDescription || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.url || "#",
+      posted: raw.pubDate ? fmtDate(raw.pubDate) : "",
+      source: "Jobicy",
+    }),
+  },
+  {
+    name: "Remotive",
+    url: "https://remotive.com/api/remote-jobs?limit=60",
+    parseList: (data)=> Array.isArray(data?.jobs) ? data.jobs : [],
+    normalize: (raw)=>({
+      id: "remotive_"+(raw.id || raw.url || Math.random()),
+      title: raw.title || "Untitled role",
+      company: raw.company_name || "Unknown company",
+      // Remotive tags each listing with the countries/regions candidates may apply from —
+      // this is what makes country filtering meaningful for this source.
+      location: raw.candidate_required_location || "Remote / Worldwide",
+      tags: Array.isArray(raw.tags) ? raw.tags : (raw.category ? [raw.category] : []),
+      description: (raw.description || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.url || "#",
+      posted: raw.publication_date ? fmtDate(raw.publication_date) : "",
+      source: "Remotive",
+    }),
+  },
+];
+/* Optional extra source: Adzuna genuinely indexes country-specific job boards
+   (not just remote roles), but requires a free personal app_id/app_key from
+   https://developer.adzuna.com — there's no public keyless endpoint, and we
+   can't ship a shared key in client-side code (it would be exposed to every
+   visitor and breach Adzuna's terms). When the user pastes their own key in
+   Advanced settings below, it's included as one more live source. */
+function adzunaSource(country, keyword){
+  const cc = country.adzuna;
+  const appId = DB?.settings?.adzunaAppId, appKey = DB?.settings?.adzunaAppKey;
+  if(!cc || !appId || !appKey) return null;
+  const q = encodeURIComponent(keyword || "internship");
+  return {
+    name: "Adzuna",
+    url: `https://api.adzuna.com/v1/api/jobs/${cc}/search/1?app_id=${encodeURIComponent(appId)}&app_key=${encodeURIComponent(appKey)}&results_per_page=30&what=${q}&content-type=application/json`,
+    parseList: (data)=> Array.isArray(data?.results) ? data.results : [],
+    normalize: (raw)=>({
+      id: "adzuna_"+(raw.id || raw.redirect_url || Math.random()),
+      title: raw.title || "Untitled role",
+      company: raw.company?.display_name || "Unknown company",
+      location: raw.location?.display_name || country.name,
+      tags: raw.category?.label ? [raw.category.label] : [],
+      description: (raw.description || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.redirect_url || "#",
+      posted: raw.created ? fmtDate(raw.created) : "",
+      source: "Adzuna",
+    }),
+  };
+}
+/* Optional extra source: Apify. Unlike the sites we can't reach directly
+   (LinkedIn/Indeed/Glassdoor block cross-origin browser requests), Apify's
+   own API is a normal CORS-friendly JSON endpoint — Apify's servers do the
+   actual scraping and hand you back JSON. Needs your own free token from
+   https://console.apify.com/account/integrations, plus the ID of an Apify
+   "Actor" you've chosen (search the Apify Store for e.g. "LinkedIn Jobs
+   Scraper" or "Indeed Scraper" and copy its actor ID, like
+   "curious_coder/linkedin-jobs-scraper"). Note: some of these actors scrape
+   sites in ways that may violate that site's own terms of service — that's
+   between you and Apify/the target site, not something this app enforces. */
+function apifySource(country, keyword, platformKey){
+  const token = DB?.settings?.apifyToken;
+  const actorId = DB?.settings?.apifyActors?.[platformKey||"worldwide"] || (platformKey==="worldwide" ? DB?.settings?.apifyActorId : "");
+  if(!token || !actorId) return null;
+  let bodyStr = DB?.settings?.apifyInputTemplate || '{"searchQuery":"{{keyword}}","location":"{{country}}","maxItems":30}';
+  bodyStr = bodyStr
+    .replace(/\{\{keyword\}\}/g, (keyword||"internship").replace(/"/g,'\\"'))
+    .replace(/\{\{country\}\}/g, (country.name==="Worldwide / Remote" ? "" : country.name).replace(/"/g,'\\"'));
+  const encodedActor = actorId.replace("/", "~");
+  return {
+    name: "Apify",
+    method: "POST",
+    body: bodyStr,
+    url: `https://api.apify.com/v2/acts/${encodedActor}/run-sync-get-dataset-items?token=${encodeURIComponent(token)}`,
+    parseList: (data)=> Array.isArray(data) ? data : [],
+    // Actor output schemas vary a lot, so this reads several common field
+    // names rather than assuming one fixed shape.
+    normalize: (raw)=>({
+      id: "apify_"+(raw.id || raw.jobUrl || raw.link || raw.url || Math.random()),
+      title: raw.title || raw.positionName || raw.jobTitle || "Untitled role",
+      company: raw.company || raw.companyName || raw.company_name || "Unknown company",
+      location: raw.location || raw.jobLocation || raw.place || country.name,
+      tags: Array.isArray(raw.tags) ? raw.tags : (Array.isArray(raw.skills) ? raw.skills : []),
+      description: String(raw.description || raw.descriptionText || "").replace(/<[^>]+>/g," ").slice(0,220),
+      url: raw.link || raw.jobUrl || raw.url || raw.applyUrl || "#",
+      posted: raw.datePosted || raw.postedAt || raw.date || "",
+      source: "Apify",
+    }),
+  };
+}
+async function searchWorldwideJobs(){
+  WORLDWIDE_JOBS_STATE = { status:"loading", jobs:[], error:null };
+  render();
+  const country = countryByName(JOB_SEARCH_STATE.country);
+  const extras = [adzunaSource(country, JOB_SEARCH_STATE.keyword), apifySource(country, JOB_SEARCH_STATE.keyword, "worldwide")].filter(Boolean);
+  const sources = [...WORLDWIDE_JOB_SOURCES, ...extras];
+  const results = await Promise.allSettled(sources.map(async src=>{
+    const res = await fetch(src.url, src.method ? { method:src.method, headers:{"Content-Type":"application/json"}, body:src.body } : undefined);
+    if(!res.ok) throw new Error(src.name+" HTTP "+res.status);
+    const data = await res.json();
+    return src.parseList(data).map(src.normalize);
+  }));
+  let jobs = [];
+  const failedSources = [];
+  results.forEach((r, idx)=>{
+    if(r.status==="fulfilled") jobs = jobs.concat(r.value);
+    else failedSources.push(sources[idx].name);
+  });
+  // De-dupe roughly across sources by title+company.
+  const seen = new Set();
+  jobs = jobs.filter(j=>{
+    const key = (j.title+"|"+j.company).toLowerCase();
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if(jobs.length===0 && failedSources.length===sources.length){
+    WORLDWIDE_JOBS_STATE = { status:"error", jobs:[], error: "Every source failed to respond (network/CORS)." };
+  } else {
+    WORLDWIDE_JOBS_STATE = { status:"done", jobs, error: failedSources.length ? `Some sources unavailable: ${failedSources.join(", ")}` : null };
+  }
+  render();
+}
+function setWorldwideCountry(name){
+  JOB_SEARCH_STATE.country = name;
+  // Re-run the live search so a configured Adzuna key can pull that
+  // country's board too; harmless no-op re-fetch otherwise.
+  if(WORLDWIDE_JOBS_STATE.status!=="idle") searchWorldwideJobs(); else render();
+}
+function toggleAdzunaForm(){ ADZUNA_FORM_OPEN = !ADZUNA_FORM_OPEN; render(); }
+function saveAdzunaKeys(){
+  const appId = document.getElementById("adzuna_id")?.value.trim() || "";
+  const appKey = document.getElementById("adzuna_key")?.value.trim() || "";
+  mutate(db=>{ ensureSettings(db); db.settings.adzunaAppId = appId; db.settings.adzunaAppKey = appKey; });
+  toast(appId && appKey ? "Adzuna key saved — it'll be included in your next search." : "Adzuna key cleared.");
+}
+function toggleApifyForm(){ APIFY_FORM_OPEN = !APIFY_FORM_OPEN; render(); }
+function saveApifyKeys(){
+  const token = document.getElementById("apify_token")?.value.trim() || "";
+  const actorId = document.getElementById("apify_actor")?.value.trim() || "";
+  const template = document.getElementById("apify_template")?.value.trim() || "";
+  mutate(db=>{
+    ensureSettings(db);
+    db.settings.apifyToken = token;
+    db.settings.apifyActors.worldwide = actorId;
+    if(template) db.settings.apifyInputTemplate = template;
+  });
+  toast(token && actorId ? "Apify connected — it'll be included in your next search." : "Apify settings cleared.");
+}
+
+/* ---- Per-platform live search (LinkedIn / Indeed / Glassdoor tabs) ----
+   Same Apify mechanism as the Worldwide tab, but scoped to one platform's
+   own actor, own state, and rendered right inside that platform's tab. */
+let EXT_LIVE_STATE = { linkedin:{status:"idle",jobs:[],error:null}, indeed:{status:"idle",jobs:[],error:null}, glassdoor:{status:"idle",jobs:[],error:null} };
+function toggleExtApifyForm(plat){
+  EXT_APIFY_FORM_OPEN = EXT_APIFY_FORM_OPEN===plat ? null : plat;
+  render();
+}
+function saveExtApifyKeys(plat){
+  const token = document.getElementById("apify_token_"+plat)?.value.trim() || "";
+  const actorId = document.getElementById("apify_actor_"+plat)?.value.trim() || "";
+  mutate(db=>{
+    ensureSettings(db);
+    if(token) db.settings.apifyToken = token;
+    db.settings.apifyActors[plat] = actorId;
+  });
+  toast(token && actorId ? `Apify connected for ${PLATFORMS[plat].badge} — try Search live jobs.` : `${PLATFORMS[plat].badge} actor cleared.`);
+}
+async function searchExtLive(plat){
+  EXT_LIVE_STATE[plat] = { status:"loading", jobs:[], error:null };
+  render();
+  const country = countryByName(JOB_SEARCH_STATE.country);
+  const src = apifySource(country, JOB_SEARCH_STATE.keyword, plat);
+  if(!src){
+    EXT_LIVE_STATE[plat] = { status:"error", jobs:[], error:"Apify isn't connected for this platform yet." };
+    render();
+    return;
+  }
+  try{
+    const res = await fetch(src.url, { method:src.method, headers:{"Content-Type":"application/json"}, body:src.body });
+    if(!res.ok) throw new Error("HTTP "+res.status);
+    const data = await res.json();
+    const jobs = src.parseList(data).map(src.normalize);
+    EXT_LIVE_STATE[plat] = { status:"done", jobs, error: jobs.length===0 ? "The actor ran but returned no results — check its input format in Advanced settings." : null };
+  }catch(e){
+    EXT_LIVE_STATE[plat] = { status:"error", jobs:[], error: "Couldn't reach Apify (network/CORS/token issue): "+e.message };
+  }
+  render();
+}
+
+/* ---- 5-minute auto-refresh for real live job data ----
+   There's no free/keyless way to have a browser silently re-query Google
+   itself on a timer — Google doesn't offer a public jobs API, direct fetches
+   to google.com are blocked by CORS, and automated/scripted querying of
+   Google Search results is against Google's own Terms of Service, so that
+   path is skipped entirely rather than faked.
+   What *is* real and repeatable: the free job-board APIs behind the
+   Worldwide tab, plus Adzuna/Apify once connected. This refreshes whichever
+   of those the user has already searched at least once, so results
+   (including the LinkedIn/Indeed/Glassdoor Apify feed, once connected) stay
+   current without the user having to click "Search" again. Silent — no
+   toast/spinner spam — and skips a source entirely while a manual search on
+   it is already in flight. */
+const AUTO_REFRESH_MS = 5*60*1000;
+function startLiveJobsAutoRefresh(){
+  setInterval(()=>{
+    if(WORLDWIDE_JOBS_STATE.status==="done" || WORLDWIDE_JOBS_STATE.status==="error") searchWorldwideJobs();
+    ["linkedin","indeed","glassdoor"].forEach(plat=>{
+      const st = EXT_LIVE_STATE[plat];
+      if(st && (st.status==="done" || st.status==="error")) searchExtLive(plat);
+    });
+  }, AUTO_REFRESH_MS);
+}
+
+/* A live listing's location text is free-form ("Berlin, Germany", "EU only",
+   "Remote — Worldwide"...), so country filtering is a best-effort substring
+   match rather than an exact lookup. Remote/worldwide-open roles are always
+   kept, since candidates from any country are usually free to apply. */
+function jobMatchesCountry(job, countryName){
+  if(!countryName || countryName==="Worldwide / Remote") return true;
+  const loc = (job.location||"").toLowerCase();
+  if(/remote|worldwide|anywhere|global/.test(loc)) return true;
+  return loc.includes(countryName.toLowerCase());
+}
+function renderWorldwideJobsTab(user, s, isAdmin){
+  const p = PLATFORMS.worldwide;
+  const domainOnly = JOB_SEARCH_STATE.domainOnly && !isAdmin && s;
+  const keywords = s ? studentDomainKeywords(s) : [];
+  const country = JOB_SEARCH_STATE.country || "Worldwide / Remote";
+  const hasAdzuna = !!(DB?.settings?.adzunaAppId && DB?.settings?.adzunaAppKey);
+  const hasApify = !!(DB?.settings?.apifyToken && DB?.settings?.apifyActors?.worldwide);
+
+  let out = `
+  <div style="background:linear-gradient(135deg,${p.color} 0%,${p.color}cc 100%);color:#fff;border-radius:12px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <div>
+      <div style="font-family:'Fraunces',serif;font-size:17px;font-weight:600;">${p.label} Job Search</div>
+      <div style="font-size:13px;opacity:.85;margin-top:2px;">Live listings fetched from multiple real job boards (RemoteOK, Arbeitnow, Jobicy, Remotive${hasAdzuna?", Adzuna":""}${hasApify?", Apify":""}) worldwide. Not vetted by the Liaison Office — apply directly on the external site.</div>
+    </div>
+  </div>
+
+  <div class="card pad" style="margin-bottom:14px;">
+    <div class="row" style="align-items:flex-end;">
+      <div class="field" style="margin:0; min-width:220px;">
+        <label class="field-label">🌍 Country</label>
+        <select id="ww_country" onchange="setWorldwideCountry(this.value)">
+          ${COUNTRIES.map(c=>`<option value="${c.name}" ${c.name===country?'selected':''}>${c.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="margin:0; flex:1; min-width:200px;">
+        <label class="field-label">🔍 Keyword (optional, used by Adzuna/Apify if enabled)</label>
+        <input type="text" id="ww_kw" value="${JOB_SEARCH_STATE.keyword}" placeholder="e.g. marketing intern"
+          onkeydown="if(event.key==='Enter'){JOB_SEARCH_STATE.keyword=this.value; searchWorldwideJobs();}"/>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="toggleAdzunaForm()">${hasAdzuna?'✓ Adzuna key set':'⚙ Add Adzuna key'}</button>
+      <button class="btn btn-secondary btn-sm" onclick="toggleApifyForm()">${hasApify?'✓ Apify connected':'⚙ Connect Apify'}</button>
+    </div>
+    ${ADZUNA_FORM_OPEN ? `<div class="divider"></div>
+      <div class="muted" style="margin-bottom:8px;">Adzuna indexes real country-specific job boards (not just remote roles) across 20+ countries, but requires a free personal key — we can't ship a shared one safely. Get one in seconds at
+        <a href="https://developer.adzuna.com" target="_blank" rel="noopener noreferrer">developer.adzuna.com</a>, then paste it below. Stored locally with the rest of this app's data, never sent anywhere except directly to Adzuna's API from your browser.</div>
+      <div class="row">
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">App ID</label><input type="text" id="adzuna_id" value="${DB?.settings?.adzunaAppId||''}"/></div>
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">App Key</label><input type="text" id="adzuna_key" value="${DB?.settings?.adzunaAppKey||''}"/></div>
+        <button class="btn btn-primary btn-sm" onclick="saveAdzunaKeys()">Save</button>
+      </div>` : ''}
+    ${APIFY_FORM_OPEN ? `<div class="divider"></div>
+      <div class="muted" style="margin-bottom:8px;">Apify runs the actual scraping on its own servers using its Actor marketplace (e.g. search the Apify Store for "LinkedIn Jobs Scraper" or "Indeed Scraper") and hands the results back over a normal API call — this is how LinkedIn/Indeed listings can appear here as live data. Needs your own free token from
+        <a href="https://console.apify.com/account/integrations" target="_blank" rel="noopener noreferrer">console.apify.com</a> and the actor's ID (shown on its Store page, like <code>username/actor-name</code>). Note: scraping sites like LinkedIn may violate their terms of service — that's on you and the actor's operator, not something this app checks. Stored locally, sent only to Apify's API from your browser.</div>
+      <div class="row" style="margin-bottom:10px;">
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">API Token</label><input type="text" id="apify_token" value="${DB?.settings?.apifyToken||''}"/></div>
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">Actor ID</label><input type="text" id="apify_actor" placeholder="username/actor-name" value="${DB?.settings?.apifyActors?.worldwide||''}"/></div>
+      </div>
+      <div class="field" style="margin:0 0 10px;"><label class="field-label">Actor input JSON (use {{keyword}} and {{country}} — check the actor's Store page for its expected fields)</label>
+        <textarea id="apify_template" rows="2">${DB?.settings?.apifyInputTemplate||''}</textarea>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="saveApifyKeys()">Save</button>` : ''}
+  </div>`;
+
+  if(s){
+    out += `<div class="card pad" style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+      <div class="muted">${domainOnly ? `Filtered to your domain (<b>${s.program}</b>${s.preferredIndustry?` · ${s.preferredIndustry}`:""})` : "Showing all live listings, unfiltered."}</div>
+      <button class="btn btn-ghost btn-sm" onclick="toggleJobDomainFilter()">${domainOnly?'Show all listings':'Show only my domain'}</button>
+    </div>`;
+  }
+
+  if(WORLDWIDE_JOBS_STATE.status==="idle"){
+    out += `<div class="card pad" style="text-align:center; padding:36px 20px;">
+      <button class="btn btn-primary" onclick="searchWorldwideJobs()">🔎 Search live worldwide listings</button>
+    </div>`;
+    return out;
+  }
+  if(WORLDWIDE_JOBS_STATE.status==="loading"){
+    out += `<div class="card pad"><div class="muted">Searching live job boards worldwide…</div></div>`;
+    return out;
+  }
+  if(WORLDWIDE_JOBS_STATE.status==="error"){
+    out += `<div class="card pad" style="border-color:rgba(179,67,90,.4); background:rgba(179,67,90,.06);">
+      <div class="muted">Couldn't reach the external job boards right now (network or CORS issue): ${WORLDWIDE_JOBS_STATE.error||"unknown error"}.</div>
+      <button class="btn btn-secondary btn-sm" style="margin-top:8px;" onclick="searchWorldwideJobs()">Try again</button>
+    </div>`;
+    return out;
+  }
+  if(WORLDWIDE_JOBS_STATE.status==="done" && WORLDWIDE_JOBS_STATE.error){
+    out += `<div class="muted" style="margin-bottom:10px; font-size:12px;">⚠ ${WORLDWIDE_JOBS_STATE.error}</div>`;
+  }
+
+  const byCountry = WORLDWIDE_JOBS_STATE.jobs.filter(j=>jobMatchesCountry(j, country));
+  const matched = !domainOnly || keywords.length===0 ? byCountry : byCountry.filter(j=>matchesKeywords(`${j.title} ${j.company} ${j.tags.join(" ")} ${j.description}`, keywords));
+  const shown = matched.slice(0,30);
+
+  out += `<div class="row" style="margin-bottom:10px; justify-content:space-between;">
+    <span class="muted">${shown.length} of ${matched.length} matching result(s) shown${country!=="Worldwide / Remote"?` for <b>${country}</b> (+ remote-anywhere roles)`:""} · auto-refreshes every 5 min</span>
+    <button class="btn btn-ghost btn-sm" onclick="searchWorldwideJobs()">Refresh now</button>
+  </div>`;
+
+  out += shown.length===0
+    ? `<div class="card">${emptyState(domainOnly?"No live listings matched your domain right now":`No live listings matched ${country} right now`,"Try another country, or try again shortly — worldwide listings change constantly.")}</div>`
+    : shown.map(j=>`<div class="job-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div><div class="job-title">${j.title}</div><div class="job-company">${j.company}</div></div>
+          <span style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;background:${p.color};color:#fff;">${j.source || p.badge}</span>
+        </div>
+        <div class="job-meta" style="margin-top:6px;">
+          <span>📍 ${j.location}</span>
+          ${j.posted?`<span>🕐 ${j.posted}</span>`:""}
+        </div>
+        ${j.description?`<div class="job-desc" style="margin-top:8px;">${j.description}…</div>`:""}
+        ${j.tags.length?`<div class="job-tags">${j.tags.slice(0,8).map(t=>`<span class="job-tag">${t}</span>`).join("")}</div>`:""}
+        <div class="job-actions" style="margin-top:12px;">
+          <a href="${j.url}" target="_blank" rel="noopener noreferrer" class="btn" style="background:${p.color};color:#fff;border-color:${p.color};text-decoration:none;"
+            onclick="trackExtApply('${j.id}','worldwide','${j.title.replace(/'/g,"")}','${j.company.replace(/'/g,"")}')">✉ Apply — opens the real listing ↗</a>
+        </div>
+      </div>`).join("");
+  return out;
 }
 function renderUniversityJobsTab(user, s, isAdmin){
   if(!DB.universityJobs) DB.universityJobs = [];
@@ -1332,10 +2018,23 @@ function renderUniversityJobsTab(user, s, isAdmin){
       </div>`;
     }
   }
-  const jobs = DB.universityJobs||[];
+  const allJobs = DB.universityJobs||[];
+  const domainOnly = JOB_SEARCH_STATE.domainOnly && !isAdmin && s;
+  const domainKeywords = s ? studentDomainKeywords(s) : [];
+  const jobs = (!domainOnly || domainKeywords.length===0) ? allJobs : allJobs.filter(j=>
+    matchesKeywords(`${j.title} ${j.dept} ${j.desc} ${(j.skills||[]).join(" ")}`, domainKeywords));
+  const hiddenCount = allJobs.length - jobs.length;
+
+  if(s && !isAdmin && allJobs.length>0){
+    out += `<div class="card pad" style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+      <div class="muted">${domainOnly ? `Filtered to your domain${hiddenCount>0?` — ${hiddenCount} posting(s) hidden`:""}` : "Showing all university postings, unfiltered."}</div>
+      <button class="btn btn-ghost btn-sm" onclick="toggleJobDomainFilter()">${domainOnly?'Show all postings':'Show only my domain'}</button>
+    </div>`;
+  }
+
   if(jobs.length===0){
-    out += `<div class="card">${emptyState(isAdmin?"No university jobs posted yet":"No jobs posted yet by the university.",
-      isAdmin?"Click '+ Post a Job' above to create the first posting.":"Check back soon.")}</div>`;
+    out += `<div class="card">${emptyState(isAdmin?"No university jobs posted yet":(allJobs.length>0?"No postings in your domain right now":"No jobs posted yet by the university."),
+      isAdmin?"Click '+ Post a Job' above to create the first posting.":(allJobs.length>0?"Try \"Show all postings\" above.":"Check back soon."))}</div>`;
     return out;
   }
   out += jobs.map(j=>{
@@ -1411,173 +2110,150 @@ function renderUniversityJobsTab(user, s, isAdmin){
   }
   return out;
 }
+/* Live section shown at the top of the LinkedIn / Indeed / Glassdoor tabs.
+   Uses that platform's own Apify actor (set via the inline connect form) so
+   results actually come from that site rather than a generic worldwide mix. */
+let EXT_ADVANCED_OPEN = {}; // { linkedin:true/false, indeed:..., glassdoor:... } — collapsed by default
+function toggleExtAdvanced(plat){
+  EXT_ADVANCED_OPEN[plat] = !EXT_ADVANCED_OPEN[plat];
+  render();
+}
+function renderExtLiveSection(plat, p, country){
+  const hasActor = !!(DB?.settings?.apifyToken && DB?.settings?.apifyActors?.[plat]);
+  const open = !!EXT_ADVANCED_OPEN[plat];
+
+  // Collapsed by default — the primary, always-working flow is the real
+  // "Apply/Open" links below, which need no setup. This is opt-in only.
+  if(!open){
+    return `<div style="margin-bottom:14px;">
+      <button class="btn btn-ghost btn-sm" onclick="toggleExtAdvanced('${plat}')">⚙ Advanced (optional): show live ${p.badge} results inline${hasActor?' — connected':''}</button>
+    </div>`;
+  }
+
+  const state = EXT_LIVE_STATE[plat] || { status:"idle", jobs:[], error:null };
+  const formOpen = EXT_APIFY_FORM_OPEN === plat;
+
+  let out = `<div class="card pad" style="margin-bottom:14px; border-color:${p.color}55;">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <div>
+        <div class="name">🔴 Live ${p.badge} jobs (via Apify) <span class="muted" style="font-weight:400;">— optional</span></div>
+        <div class="muted" style="font-size:12px; margin-top:2px;">${hasActor ? `Fetches real ${p.badge} listings for “${JOB_SEARCH_STATE.keyword||'internship'}” in ${country} right now.` : `${p.badge} blocks direct browser requests, so this needs your own Apify actor. Not required — "Apply on ${p.badge}" below always works without this.`}</div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        ${hasActor ? `<button class="btn btn-primary btn-sm" onclick="searchExtLive('${plat}')">🔎 Search live ${p.badge} jobs</button>` : ""}
+        <button class="btn btn-secondary btn-sm" onclick="toggleExtApifyForm('${plat}')">${hasActor?'⚙ Edit actor':'⚙ Connect Apify'}</button>
+        <button class="btn btn-ghost btn-sm" onclick="toggleExtAdvanced('${plat}')">Hide</button>
+      </div>
+    </div>
+    ${formOpen ? `<div class="divider"></div>
+      <div class="muted" style="margin-bottom:8px; font-size:12.5px;">Get a free token at <a href="https://console.apify.com/account/integrations" target="_blank" rel="noopener noreferrer">console.apify.com</a>, then find a "${p.badge} Jobs Scraper" actor in the Apify Store and paste its ID below (looks like <code>username/actor-name</code>). Note: scraping ${p.badge} this way may run against its own terms of service — that's between you and the actor's operator.</div>
+      <div class="row">
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">API Token</label><input type="text" id="apify_token_${plat}" value="${DB?.settings?.apifyToken||''}"/></div>
+        <div class="field" style="margin:0; flex:1;"><label class="field-label">${p.badge} Actor ID</label><input type="text" id="apify_actor_${plat}" placeholder="username/actor-name" value="${DB?.settings?.apifyActors?.[plat]||''}"/></div>
+        <button class="btn btn-primary btn-sm" onclick="saveExtApifyKeys('${plat}')">Save</button>
+      </div>` : ''}
+  </div>`;
+
+  if(state.status==="loading"){
+    out += `<div class="card pad" style="margin-bottom:14px;"><div class="muted">Searching live ${p.badge} listings…</div></div>`;
+  } else if(state.status==="error"){
+    out += `<div class="card pad" style="margin-bottom:14px; border-color:rgba(179,67,90,.4); background:rgba(179,67,90,.06);"><div class="muted">${state.error}</div></div>`;
+  } else if(state.status==="done"){
+    out += `<div class="muted" style="margin-bottom:10px; font-size:12px;">${state.jobs.length} live result(s) from ${p.badge} · auto-refreshes every 5 min.</div>`;
+    out += state.jobs.slice(0,20).map(j=>`<div class="job-card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div><div class="job-title">${j.title}</div><div class="job-company">${j.company}</div></div>
+        <span style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;background:${p.color};color:#fff;">${p.badge} · Live</span>
+      </div>
+      <div class="job-meta" style="margin-top:6px;"><span>📍 ${j.location}</span>${j.posted?`<span>🕐 ${j.posted}</span>`:""}</div>
+      ${j.description?`<div class="job-desc" style="margin-top:8px;">${j.description}…</div>`:""}
+      ${j.tags.length?`<div class="job-tags">${j.tags.slice(0,8).map(t=>`<span class="job-tag">${t}</span>`).join("")}</div>`:""}
+      <div class="job-actions" style="margin-top:12px;">
+        <a href="${j.url}" target="_blank" rel="noopener noreferrer" class="btn" style="background:${p.color};color:#fff;border-color:${p.color};text-decoration:none;"
+          onclick="trackExtApply('${j.id}','${plat}','${j.title.replace(/'/g,"")}','${j.company.replace(/'/g,"")}')">✉ Apply — opens the real listing ↗</a>
+      </div>
+    </div>`).join("");
+  }
+  return out;
+}
+function externalSearchTerms(){
+  return [
+    JOB_SEARCH_STATE.keyword,
+    JOB_SEARCH_STATE.type !== "All" ? JOB_SEARCH_STATE.type : "",
+    JOB_SEARCH_STATE.industry !== "All" ? JOB_SEARCH_STATE.industry : ""
+  ].filter(Boolean).join(" ").trim() || "internship";
+}
+function selectedSearchLocation(){
+  return (JOB_SEARCH_STATE.location||"").trim() || JOB_SEARCH_STATE.country || "Worldwide / Remote";
+}
 function renderExternalJobsTab(user, s, isAdmin, plat){
   const p = PLATFORMS[plat];
-  const kw       = JOB_SEARCH_STATE.keyword.toLowerCase();
-  const locFilt  = JOB_SEARCH_STATE.location;
-  const typeFilt = JOB_SEARCH_STATE.type;
-  const indFilt  = JOB_SEARCH_STATE.industry;
-  const salFilt  = JOB_SEARCH_STATE.salary;
-  const page     = JOB_SEARCH_STATE.page || 0;
-
-  const jobs = EXT_JOBS.filter(j=>{
-    const mk = !kw || j.title.toLowerCase().includes(kw)||j.company.toLowerCase().includes(kw)||
-               j.desc.toLowerCase().includes(kw)||j.tags.some(t=>t.toLowerCase().includes(kw));
-    const ml = locFilt==="All" || j.location===locFilt;
-    const mt = typeFilt==="All" || j.type===typeFilt;
-    const mi = indFilt==="All" || j.industry===indFilt;
-    const ms = salFilt==="All" || salFilt==="Paid" && j.salary && !j.salary.includes("Unpaid") ||
-               salFilt==="Unpaid" && (!j.salary || j.salary.includes("Unpaid"));
-    return mk&&ml&&mt&&mi&&ms;
-  });
-
-  const totalPages = Math.max(1, Math.ceil(jobs.length / EXT_PAGE_SIZE));
-  const safePage   = Math.min(page, totalPages-1);
-  const pageJobs   = jobs.slice(safePage*EXT_PAGE_SIZE, (safePage+1)*EXT_PAGE_SIZE);
-
-  const locations  = ["All", ...new Set(EXT_JOBS.map(j=>j.location))];
-  const types      = ["All", ...new Set(EXT_JOBS.map(j=>j.type))];
-  const industries = ["All", ...new Set(EXT_JOBS.map(j=>j.industry).filter(Boolean))];
-
+  const country = PAKISTAN_PLATFORMS.has(plat) ? "Pakistan" : (JOB_SEARCH_STATE.country || "Worldwide / Remote");
+  const location = JOB_SEARCH_STATE.location || "";
+  const regionNote = REGION_LOCKED_PLATFORMS[plat];
+  const searchTerms = externalSearchTerms();
+  const shownLocation = location || country;
   let out = `
   <div style="background:linear-gradient(135deg,${p.color} 0%,${p.color}cc 100%);color:#fff;border-radius:12px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
     <div>
       <div style="font-family:'Fraunces',serif;font-size:17px;font-weight:600;">${p.label} Job Search</div>
-      <div style="font-size:13px;opacity:.85;margin-top:2px;">Search & filter jobs. Click "Apply on ${p.badge}" to open the real job listing.</div>
+      <div style="font-size:13px;opacity:.9;margin-top:2px;">Search: <b>${searchTerms}</b> · Location: <b>${shownLocation}</b></div>
     </div>
-    <button class="btn" style="background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.4);"
-      onclick="openPlatformSearch('${plat}')">🔎 Open ${p.badge}</button>
+    <button class="btn" style="background:rgba(255,255,255,.2);color:#fff;border-color:rgba(255,255,255,.4);" onclick="searchExtJobs('${plat}')">🔎 Search ${p.badge} ↗</button>
   </div>
+  ${regionNote ? `<div class="card pad" style="margin-bottom:14px;border-color:rgba(201,134,42,.4);background:rgba(201,134,42,.08);"><div class="muted">${regionNote}. The selected fields are still included in the search, but the provider may limit available regions.</div></div>` : ""}
 
   <div class="card pad" style="margin-bottom:14px;">
-    <div class="grid grid-2" style="gap:10px 16px; margin-bottom:10px;">
-      <div class="field" style="margin:0; grid-column:1/-1;">
-        <label class="field-label">🔍 Search Keywords</label>
-        <input type="text" id="ext_kw_${plat}" value="${JOB_SEARCH_STATE.keyword}"
-          placeholder="Job title, company, skill..." onkeydown="if(event.key==='Enter')searchExtJobs('${plat}')"/>
+    <div class="grid grid-2" style="gap:10px 16px;margin-bottom:12px;">
+      <div class="field" style="margin:0;grid-column:1/-1;">
+        <label class="field-label">🔍 Job title, company, or skills</label>
+        <input type="text" id="ext_kw_${plat}" value="${JOB_SEARCH_STATE.keyword}" placeholder="e.g. Data Analyst Internship" onkeydown="if(event.key==='Enter')searchExtJobs('${plat}')"/>
       </div>
       <div class="field" style="margin:0;">
-        <label class="field-label">📍 Location</label>
-        <select id="ext_loc_${plat}" onchange="filterExtJobs('${plat}')">
-          ${locations.map(l=>`<option value="${l}" ${l===locFilt?'selected':''}>${l}</option>`).join('')}
+        <label class="field-label">🌍 Country</label>
+        ${PAKISTAN_PLATFORMS.has(plat)
+          ? `<input type="text" value="Pakistan" disabled title="${p.badge} searches jobs in Pakistan"/>`
+          : `<select id="ext_country_${plat}" onchange="setExtCountry('${plat}',this.value)">
+              ${COUNTRIES.map(c=>`<option value="${c.name}" ${c.name===country?'selected':''}>${c.name}</option>`).join('')}
+            </select>`}
+      </div>
+      <div class="field" style="margin:0;">
+        <label class="field-label">📍 Location (city, region, or remote)</label>
+        ${PAKISTAN_PLATFORMS.has(plat)
+          ? `<select id="ext_loc_${plat}">
+              ${PAKISTAN_CITIES.map(c=>`<option value="${c}" ${c===location?'selected':''}>${c||'All Pakistan'}</option>`).join('')}
+            </select>`
+          : `<input type="text" id="ext_loc_${plat}" value="${location}" placeholder="e.g. Lahore, London, Remote"/>`}
+      </div>
+      <div class="field" style="margin:0;">
+        <label class="field-label">💼 Job type</label>
+        <select id="ext_type_${plat}">
+          ${["All","Internship","Part-time","Full-time","Remote","Graduate"].map(v=>`<option ${JOB_SEARCH_STATE.type===v?'selected':''}>${v}</option>`).join('')}
         </select>
       </div>
       <div class="field" style="margin:0;">
-        <label class="field-label">💼 Job Type</label>
-        <select id="ext_type_${plat}" onchange="filterExtJobs('${plat}')">
-          ${types.map(t=>`<option value="${t}" ${t===typeFilt?'selected':''}>${t}</option>`).join('')}
-        </select>
-      </div>
-      <div class="field" style="margin:0;">
-        <label class="field-label">🏭 Industry</label>
-        <select id="ext_ind_${plat}" onchange="filterExtJobs('${plat}')">
-          ${industries.map(i=>`<option value="${i}" ${i===indFilt?'selected':''}>${i}</option>`).join('')}
-        </select>
+        <label class="field-label">🏭 Industry / field</label>
+        <input type="text" id="ext_ind_${plat}" value="${JOB_SEARCH_STATE.industry==="All"?"":JOB_SEARCH_STATE.industry}" placeholder="e.g. Technology, Finance"/>
       </div>
       <div class="field" style="margin:0;">
         <label class="field-label">💰 Compensation</label>
-        <select id="ext_sal_${plat}" onchange="filterExtJobs('${plat}')">
-          <option value="All" ${salFilt==="All"?'selected':''}>All</option>
-          <option value="Paid" ${salFilt==="Paid"?'selected':''}>Paid</option>
-          <option value="Unpaid" ${salFilt==="Unpaid"?'selected':''}>Unpaid / Voluntary</option>
+        <select id="ext_sal_${plat}">
+          ${["All","Paid","Unpaid","Stipend"].map(v=>`<option ${JOB_SEARCH_STATE.salary===v?'selected':''}>${v}</option>`).join('')}
         </select>
       </div>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-      <button class="btn btn-primary" onclick="searchExtJobs('${plat}')">Search</button>
-      <button class="btn btn-secondary" onclick="clearExtJobs()">Clear Filters</button>
-      <button class="btn btn-ghost" style="background:${p.color};color:#fff;border-color:${p.color};" onclick="openPlatformSearch('${plat}')">Open ${p.badge} ↗</button>
+      <button class="btn btn-primary" onclick="searchExtJobs('${plat}')">Search live jobs on ${p.badge} ↗</button>
+      <button class="btn btn-secondary" onclick="clearExtJobs('${plat}')">Clear fields</button>
     </div>
+    <div class="muted" style="margin-top:10px;font-size:12px;">No sample or dummy jobs are stored here. Search opens ${p.badge}'s current website results using your selected fields and location.</div>
   </div>
-
-  <div class="job-filters">
-    <span style="font-size:12px;color:var(--brand-500);display:flex;align-items:center;margin-right:4px;">Quick:</span>
-    ${["Marketing","Finance","Data Analytics","Software","HR","Design","Supply Chain","Banking"].map(f=>
-      `<span class="job-filter-chip ${kw===f.toLowerCase()?'active':''}" onclick="quickExtFilter('${f}')">${f}</span>`
-    ).join('')}
-  </div>
-  <div class="job-count" style="display:flex;justify-content:space-between;align-items:center;">
-    <span>${kw||locFilt!=="All"||typeFilt!=="All"||indFilt!=="All"
-      ?`Showing <b>${jobs.length}</b> result(s)` : `<b>${jobs.length}</b> available positions`}
-      &nbsp;·&nbsp; Page <b>${safePage+1}</b> of <b>${totalPages}</b>
-    </span>
+  ${["linkedin","indeed","glassdoor"].includes(plat) ? renderExtLiveSection(plat,p,shownLocation) : ""}
+  <div class="card pad" style="text-align:center;padding:28px 20px;">
+    <div class="name">Ready to search live listings</div>
+    <div class="muted" style="margin:6px 0 14px;">${searchTerms} · ${shownLocation}</div>
+    <button class="btn btn-primary" style="background:${p.color};border-color:${p.color};" onclick="searchExtJobs('${plat}')">Open live ${p.badge} results ↗</button>
   </div>`;
-
-  if(pageJobs.length===0){
-    out += `<div class="card">${emptyState("No matching jobs","Try different filters or open ${p.badge} directly for live results.")}</div>`;
-  } else {
-    out += pageJobs.map(j=>{
-      const jobUrl = j.urls[plat] || platformSearchURL(plat, j.title);
-      const bookmarked = JOB_SEARCH_STATE.bookmarks.has(j.id+plat);
-      return `<div class="job-card">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-          <div>
-            <div class="job-title">${j.title}</div>
-            <div class="job-company">${j.company}</div>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center;">
-            <span style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;background:${p.color};color:#fff;">${p.badge}</span>
-            <button class="btn btn-ghost btn-sm" onclick="toggleExtBookmark('${j.id+plat}')" title="Bookmark">${bookmarked?'★':'☆'}</button>
-          </div>
-        </div>
-        <div class="job-meta" style="margin-top:6px;">
-          <span>📍 ${j.location}</span>
-          <span>💼 ${j.type}</span>
-          ${j.industry?`<span>🏭 ${j.industry}</span>`:''}
-          ${j.salary?`<span>💰 ${j.salary}</span>`:''}
-          <span>🕐 ${j.posted}</span>
-        </div>
-        <div class="job-desc" style="margin-top:8px;">${j.desc}</div>
-        <div class="job-tags">${j.tags.map(t=>`<span class="job-tag">${t}</span>`).join('')}</div>
-        <div class="job-actions" style="margin-top:12px;">
-          <a href="${jobUrl}" target="_blank" rel="noopener noreferrer"
-            class="btn" style="background:${p.color};color:#fff;border-color:${p.color};text-decoration:none;"
-            onclick="trackExtApply('${j.id}','${plat}','${j.title.replace(/'/g,"")}','${j.company}')">
-            ✉ Apply on ${p.badge}
-          </a>
-          <a href="${jobUrl}" target="_blank" rel="noopener noreferrer"
-            class="btn btn-secondary btn-sm" style="text-decoration:none;">View Listing ↗</a>
-        </div>
-      </div>`;
-    }).join('');
-  }
-
-  /* Pagination */
-  if(totalPages > 1){
-    out += `<div style="display:flex;justify-content:center;gap:8px;margin:16px 0;">
-      <button class="btn btn-secondary btn-sm" onclick="extPage(${safePage-1})" ${safePage===0?'disabled':''}>← Prev</button>
-      ${Array.from({length:totalPages},(_,i)=>`<button class="btn btn-sm ${i===safePage?'btn-primary':'btn-secondary'}" onclick="extPage(${i})">${i+1}</button>`).join('')}
-      <button class="btn btn-secondary btn-sm" onclick="extPage(${safePage+1})" ${safePage>=totalPages-1?'disabled':''}>Next →</button>
-    </div>`;
-  }
-
-  /* Show student's tracked external applications */
-  if(!isAdmin && s){
-    const extApps = (DB.jobApplications||[]).filter(a=>a.studentId===s.id && a.platform===plat);
-    if(extApps.length>0){
-      out += `<div class="divider"></div><div class="name" style="margin-bottom:10px;">My ${p.badge} Applications (${extApps.length})</div>`;
-      out += extApps.map(a=>`<div class="card pad" style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
-        <div><div class="name">${a.title||'Job'}</div><div class="muted">${a.company||''} · Applied ${fmtDate(a.appliedAt)}</div></div>
-        ${badge("SUBMITTED")}
-      </div>`).join('');
-    }
-  }
-
-  /* Admin: all external applications across all students */
-  if(isAdmin){
-    const allExtApps = (DB.jobApplications||[]).filter(a=>a.platform===plat);
-    out += `<div class="divider"></div><div class="name" style="margin-bottom:10px;">Student Applications via ${p.badge} (${allExtApps.length})</div>`;
-    if(allExtApps.length===0){
-      out += `<div class="card">${emptyState("No applications recorded yet","Tracks when students click Apply on this tab.")}</div>`;
-    } else {
-      out += `<div class="card">${allExtApps.map(a=>{
-        const stu = DB.students.find(x=>x.id===a.studentId);
-        const uUsr = stu ? userById(stu.userId) : null;
-        return `<div class="list-row"><div><div class="name">${uUsr?uUsr.name:'Unknown'}</div>
-          <div class="muted">${a.title||'Job'} @ ${a.company||''} · ${fmtDate(a.appliedAt)}</div></div>${badge("SUBMITTED")}</div>`;
-      }).join('')}</div>`;
-    }
-  }
   return out;
 }
 
@@ -1644,22 +2320,20 @@ function updateUniJobAppStatus(appId, status){
 /* ---- External job helpers ---- */
 function searchExtJobs(plat){
   JOB_SEARCH_STATE.keyword = (document.getElementById("ext_kw_"+plat)?.value||"").trim();
+  JOB_SEARCH_STATE.location  = (document.getElementById("ext_loc_"+plat)?.value||"").trim();
+  JOB_SEARCH_STATE.type      = document.getElementById("ext_type_"+plat)?.value || "All";
+  JOB_SEARCH_STATE.industry  = (document.getElementById("ext_ind_"+plat)?.value||"").trim() || "All";
+  JOB_SEARCH_STATE.salary    = document.getElementById("ext_sal_"+plat)?.value  || "All";
+  const url = platformSearchURL(plat, externalSearchTerms(), JOB_SEARCH_STATE.country, JOB_SEARCH_STATE.location);
+  window.open(url, "_blank", "noopener,noreferrer");
   render();
 }
-
-function filterExtJobs(plat){
-  JOB_SEARCH_STATE.location  = document.getElementById("ext_loc_"+plat)?.value  || "All";
-  JOB_SEARCH_STATE.type      = document.getElementById("ext_type_"+plat)?.value || "All";
-  JOB_SEARCH_STATE.industry  = document.getElementById("ext_ind_"+plat)?.value  || "All";
-  JOB_SEARCH_STATE.salary    = document.getElementById("ext_sal_"+plat)?.value  || "All";
-  JOB_SEARCH_STATE.page = 0; render();
-}
-function extPage(n){
-  JOB_SEARCH_STATE.page = Math.max(0, n); render();
-  document.getElementById("main")?.scrollTo(0,0);
-}
-function clearExtJobs(){
+function clearExtJobs(plat){
   JOB_SEARCH_STATE.keyword="";
+  JOB_SEARCH_STATE.location="";
+  JOB_SEARCH_STATE.type="All";
+  JOB_SEARCH_STATE.industry="All";
+  JOB_SEARCH_STATE.salary="All";
   render();
 }
 function quickExtFilter(term){
@@ -1672,7 +2346,10 @@ function toggleExtBookmark(key){
   render();
 }
 function openPlatformSearch(plat){
-  window.open(platformSearchURL(plat, JOB_SEARCH_STATE.keyword||"internship Pakistan"), "_blank","noopener,noreferrer");
+  window.open(platformSearchURL(plat, externalSearchTerms(), JOB_SEARCH_STATE.country, JOB_SEARCH_STATE.location), "_blank","noopener,noreferrer");
+}
+function setExtCountry(plat, name){
+  JOB_SEARCH_STATE.country = name;
 }
 function trackExtApply(jobId, plat, title, company){
   const user = currentUser();
